@@ -1,0 +1,5 @@
+# Optional: publish PostgreSQL only when running the backend outside Docker.
+services:
+  db:
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-15432}:5432"
