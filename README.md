@@ -43,6 +43,13 @@ level; `auto` preserves model defaults and `off` requests no thinking where supp
 The output budget is configurable through `OLLAMA_NUM_PREDICT` (default 4096).
 Larger analyses may require a larger budget; incomplete output is rejected, never
 silently accepted. Increasing the timeout permits a longer wait but does not speed up generation.
+
+Targeted answer updates use a small text-only patch contract. Python assigns
+provenance labels and merges original/answer source references, so a valid update
+does not depend on the model copying citation strings exactly. Requirement IDs
+remain strict. Invalid patches receive at most one targeted correction attempt;
+network timeouts are not repeated by that repair loop. Previous versions and the
+clarification checkpoint remain unchanged if validation still fails.
 invalid JSON, missing fields, incomplete generations and compatibility errors
 fail explicitly. Responses omit remote error bodies and credentials. Usage tracks
 input/output tokens, wall latency including network retries and attempt count.
@@ -128,6 +135,7 @@ docker compose ps
 docker compose exec backend alembic current
 docker compose exec backend alembic check
 docker compose exec backend python -m app.check_ollama
+docker compose exec backend python -m app.check_ollama --no-probe --update-probe --attempts 1
 docker compose logs --tail 50 backend
 ```
 
@@ -331,6 +339,13 @@ succeeded in 54.3 seconds, returning validated requirements and two clarificatio
 questions and pausing at the LangGraph interrupt. This is a sample measurement,
 not a response-time guarantee for larger documents. The updated test suite passed
 all 51 tests, including generation timeout and reasoning/output controls.
+
+The subsequent clarification fix passed 54 tests, Ruff and the frontend production
+build. A live synthetic targeted update against the configured remote model
+completed in 5.6 seconds, produced validated requirement updates and a DRAFT
+description with a customer decision log. No customer project was modified by
+the probe. New descriptions and answer batches require no database migration;
+existing persisted clarification checkpoints remain compatible.
 
 Windows initially denied binding host port 5432. The standard Compose stack now
 uses only Docker's internal database network and does not publish that port.
