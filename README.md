@@ -44,12 +44,19 @@ The output budget is configurable through `OLLAMA_NUM_PREDICT` (default 4096).
 Larger analyses may require a larger budget; incomplete output is rejected, never
 silently accepted. Increasing the timeout permits a longer wait but does not speed up generation.
 
-Targeted answer updates use a small text-only patch contract. Python assigns
-provenance labels and merges original/answer source references, so a valid update
-does not depend on the model copying citation strings exactly. Requirement IDs
-remain strict. Invalid patches receive at most one targeted correction attempt;
-network timeouts are not repeated by that repair loop. Previous versions and the
-clarification checkpoint remain unchanged if validation still fails.
+Answer updates are deterministic and make no model call. Original requirement
+text/provenance is preserved. Every active confirmed answer becomes a separate,
+stable decision requirement with the exact selected values and an answer source
+reference. Editing or invalidating an answer replaces/removes the corresponding
+decision while preserving history. Unchanged generic requirements never gain
+customer-confirmed labels merely because a source reference was attached.
+
+Initial extraction is followed by an independent, structured source-support review.
+Unsupported elaborations such as assumed CRUD privileges are separated as assumptions.
+This is a model-assisted quality check, not proof of semantic correctness or approval;
+customer review remains necessary. The working description includes actual decisions,
+gap resolution status and an explicit list of remaining blockers. TBD/unknown answers
+are saved but do not resolve a blocking question.
 invalid JSON, missing fields, incomplete generations and compatibility errors
 fail explicitly. Responses omit remote error bodies and credentials. Usage tracks
 input/output tokens, wall latency including network retries and attempt count.
@@ -184,7 +191,7 @@ versions, and creates `analysis_versions`, `clarification_answers`, and
 validated requirements, draft summary and cumulative usage. Answer edits append
 revisions; old analysis snapshots preserve the answers effective at that time.
 
-`ba_graph.py` executes extraction, clarification interrupt, targeted update and
+`ba_graph.py` executes extraction/source review, clarification interrupt, deterministic update and
 deterministic summary nodes. A SQL-backed transactional saver buffers LangGraph
 checkpoints and pending writes without sharing database sessions across worker
 threads. Graph runtime, analysis, answer revisions, project state and domain
@@ -213,12 +220,12 @@ not executed beyond the Phase 2 clarification loop.
    objectives, scope, roles and assumptions, instead of being hidden in evidence details.
 3. Answer the prioritized clarification batch (at most five) using checklist/radio
    options or free text, then choose **Save answers and continue**. A batch uses
-   one targeted model update. Select answers are
+   no additional model inference. Select answers are
    validated against options. Conditional questions appear after their parent
    answer is saved. Unanswered prerequisites of blocking children are also required.
-4. Each save creates a new analysis version. Only affected baseline requirements,
-   relevant questions and effective customer answers are sent to the model;
-   original documents are not reprocessed. Unaffected requirements remain unchanged.
+4. Each save creates a new analysis version containing explicit customer decision
+   requirements. Original documents are not reprocessed and no model rewrites
+   customer facts. Existing statements remain traceable to their original source.
 5. Editing a parent invalidates dependent answers. Affected requirements are rebuilt
    from the structured baseline and remaining answers, removing obsolete decisions.
 6. Once blockers are resolved, download the DRAFT JSON and Markdown summary.
@@ -226,6 +233,14 @@ not executed beyond the Phase 2 clarification loop.
    customer decision log alongside the consolidated requirements.
    Open non-blocking questions remain visible and may be answered from review.
    The version selector shows prior immutable analysis snapshots.
+
+For a project created before the business-content fix, choose **Rebuild description
+from saved answers** after deploying the updated images. This runs source-support
+review once and appends a new analysis version using the answers already saved.
+It does not replace intake text, delete old versions, or select unanswered options.
+The shopping-platform example still requires Q006 and Q007; the progress panel
+shows their question text as blockers rather than silently hiding the final draft.
+The working description remains available during clarification.
 
 The summary includes overview, business objectives, scope, roles, functional and
 non-functional requirements, rules, constraints, dependencies, assumptions and
@@ -254,6 +269,7 @@ refresh before retrying to obtain the new project version.
 | GET | `/api/projects/{id}/analysis?version=1` | Current or historical analysis JSON |
 | GET | `/api/projects/{id}/analysis/versions` | Paginated analysis version index |
 | POST | `/api/projects/{id}/answers` | Submit/edit up to five answers with `expected_version` |
+| POST | `/api/projects/{id}/reconcile` | Recheck source support and rebuild from saved answers; creates a new version |
 | GET | `/api/projects/{id}/answers/history` | Paginated immutable answer revisions |
 | GET | `/api/projects/{id}/summary.md?version=1` | Current or historical draft Markdown |
 
@@ -283,7 +299,7 @@ DOCX tables and paragraphs and PDF page/line references are retained. No OCR:
 scanned/image-only PDFs are rejected when no text is extracted. No raw upload is
 written to application storage. Documents and model output are untrusted data.
 
-Analysis currently uses one extraction call per document. The remote model must
+Analysis uses an extraction call and a source-support review per document. The remote model must
 have enough context/output capacity; large documents may fail or exceed its
 capacity. Chunked extraction and cross-chunk reconciliation are not implemented.
 Semantic correctness still requires customer review: schema/provenance checks
@@ -350,3 +366,32 @@ existing persisted clarification checkpoints remain compatible.
 Windows initially denied binding host port 5432. The standard Compose stack now
 uses only Docker's internal database network and does not publish that port.
 The optional development override publishes port 15432 for a host-run backend.
+
+## Latest business-content correction
+
+Implemented explicit, stable decision requirements containing the customer's exact
+selected values; unchanged original statements keep their original provenance.
+Answer saves no longer invoke Ollama. Deferred/TBD answers remain unresolved.
+Initial extraction now includes a separate structured source-support review;
+unsupported elaborations are presented as assumptions with review notes.
+The dashboard shows one current working description, gap statuses, question progress
+and exact completion blockers. Original interpretation and technical evidence are
+collapsed reference views. DRAFT exports appear only when required clarifications
+and source review are complete.
+
+Latest local verification: Ruff passed, 60 pytest tests passed, and the frontend
+TypeScript/Vite build passed. Content tests cover payment and delivery choices,
+unchanged provenance, unsupported CRUD, deferred answers, conditional gaps, stable
+IDs after edits, and version-preserving reconciliation. The Docker deployment
+request for this correction was denied, so these changes have not been applied
+to the running containers and the saved customer project has not been reconciled.
+
+To apply the prepared changes:
+
+```powershell
+docker compose up --build -d
+```
+
+Then reload the dashboard and rebuild the saved description. The source-support
+review remains an LLM judgment requiring customer review; it is not a proof of
+entailment or authorization to approve requirements.

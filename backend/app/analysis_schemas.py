@@ -36,6 +36,7 @@ class ExtractedRequirement(StrictModel):
     text: str = Field(min_length=1, max_length=10000)
     origin: Literal["stated", "assumption", "customer_answer"]
     source_refs: list[str] = Field(max_length=200)
+    resolution: Literal["ACTIVE", "SUPERSEDED"] = "ACTIVE"
 
     @model_validator(mode="after")
     def provenance(self):
@@ -60,6 +61,7 @@ class Question(StrictModel):
     blocking: bool
     priority: int = Field(ge=1, le=5)
     condition: Condition | None
+    decision_category: Category = "business_rule"
 
     @model_validator(mode="after")
     def choices(self):
@@ -86,6 +88,9 @@ class AnalysisDocument(StrictModel):
     requirements: list[ExtractedRequirement] = Field(min_length=1, max_length=500)
     gaps: list[Gap] = Field(max_length=100)
     questions: list[Question] = Field(max_length=50)
+    decision_requirement_ids: dict[str, str] = Field(default_factory=dict)
+    grounding_reviewed: bool = False
+    grounding_notes: dict[str, str] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def references(self):
@@ -114,14 +119,20 @@ class AnalysisDocument(StrictModel):
         return self
 
 
-class RequirementUpdate(StrictModel):
-    id: str = Field(pattern=r"^R[0-9]{3,6}$")
-    text: str = Field(min_length=1, max_length=10000)
-    resolved_category: Category | None = None
+class GroundingAssessment(StrictModel):
+    requirement_id: str
+    supported: bool
+    reason: str = Field(min_length=1, max_length=2000)
 
 
-class RequirementPatch(StrictModel):
-    requirements: list[RequirementUpdate] = Field(min_length=1, max_length=500)
+class QuestionCategory(StrictModel):
+    question_id: str
+    category: Category
+
+
+class GroundingReview(StrictModel):
+    assessments: list[GroundingAssessment] = Field(min_length=1, max_length=500)
+    question_categories: list[QuestionCategory]
 
 
 class Answer(StrictModel):
@@ -142,6 +153,8 @@ class ClarificationDecision(StrictModel):
     question: str
     answer: AnswerValue
     related_requirement_ids: list[str]
+    status: Literal["CONFIRMED", "DEFERRED"] = "CONFIRMED"
+    requirement_id: str | None = None
 
 
 class DraftSummary(StrictModel):
@@ -167,6 +180,7 @@ class AnalysisRead(StrictModel):
     source_version: int
     document: AnalysisDocument
     initial_description: DraftSummary
+    working_description: DraftSummary
     sources: list[Source]
     summary: DraftSummary | None
     markdown: str | None
@@ -174,3 +188,6 @@ class AnalysisRead(StrictModel):
     answers: dict[str, AnswerValue]
     questions: list[Question]
     answered_questions: list[Question]
+    gap_statuses: list[dict]
+    progress: dict
+    needs_reconciliation: bool

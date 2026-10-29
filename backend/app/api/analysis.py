@@ -94,6 +94,11 @@ def answer(project_id: UUID, data: AnswerSubmission, db: Database, llm: LLM) -> 
     return run_analysis(db, get_project(project_id, db), data.expected_version, llm, data)
 
 
+@router.post("/projects/{project_id}/reconcile", response_model=AnalysisRead)
+def reconcile(project_id: UUID, data: VersionRequest, db: Database, llm: LLM) -> dict:
+    return run_analysis(db, get_project(project_id, db), data.expected_version, llm, reconcile=True)
+
+
 @router.get("/projects/{project_id}/answers/history")
 def answer_history(
     project_id: UUID,

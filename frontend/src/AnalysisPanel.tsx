@@ -8,12 +8,18 @@ type Question = {id: string; text: string; type: string; options: string[];
   condition: {question_id: string; any_of: string[]} | null};
 type Requirement = {id: string; text: string; category: string; origin: string; source_refs: string[]};
 type Description = {status: string; project_overview: string; sections: Record<string, Requirement[]>;
-  clarification_decisions?: {question_id: string; question: string; answer: Value}[];
+  clarification_decisions?: {question_id: string; question: string; answer: Value; status?: string}[];
   open_non_blocking_questions: Question[]};
 type Analysis = {version: number; state: string; questions: Question[]; answered_questions: Question[];
   answers: Record<string, Value>; markdown: string | null; summary: Description | null;
   initial_description: Description;
-  document: {overview: string; requirements: Requirement[]; gaps: {kind: string; description: string; question_ids: string[]}[]};
+  working_description: Description;
+  needs_reconciliation: boolean;
+  progress: {total_questions: number; answered_questions: number; blocking_reasons: string[];
+    remaining_required_question_ids: string[]; summary_ready: boolean};
+  gap_statuses: {id: string; description: string; status: string; pending_question_ids: string[]}[];
+  document: {overview: string; requirements: Requirement[]; grounding_notes?: Record<string, string>;
+    gaps: {kind: string; description: string; question_ids: string[]}[]};
   sources: {id: string; location: string; text: string}[];
   usage: {input_tokens: number; output_tokens: number; latency_ms: number; attempts: number}[]};
 
@@ -63,13 +69,17 @@ function QuestionBatch({questions, busy, save}: {questions: Question[]; busy: bo
 function BADescription({description}: {description: Description}) {
   return <div className="ba-description"><p className="overview">{description.project_overview}</p>
     {Object.entries(description.sections).map(([heading, requirements]) => <div key={heading}>
-      <h4>{heading}</h4>{requirements.length ? <ul>{requirements.map(r => <li key={r.id}>
+      {requirements.length > 0 && <><h4>{heading}</h4><ul>{requirements.map(r => <li key={r.id}>
         {r.text} {r.origin === 'assumption' && <small className="assumption">(Assumption — needs confirmation)</small>}
-      </li>)}</ul> : <p className="muted">Not specified.</p>}
+      </li>)}</ul></>}
     </div>)}
-    {!!description.clarification_decisions?.length && <><h4>Customer decisions</h4>
+    {Object.values(description.sections).some(items => !items.length) && <p className="muted">
+      Not yet specified: {Object.entries(description.sections).filter(([, items]) => !items.length)
+        .map(([heading]) => heading).join(', ')}.</p>}
+    {!!description.clarification_decisions?.length && <details><summary>Customer decision log</summary>
       <dl>{description.clarification_decisions.map(d => <div key={d.question_id}><dt>{d.question}</dt>
-        <dd>{Array.isArray(d.answer) ? d.answer.join(', ') : d.answer}</dd></div>)}</dl></>}
+        <dd>{Array.isArray(d.answer) ? d.answer.join(', ') : d.answer}
+          {d.status === 'DEFERRED' && <strong> — unresolved</strong>}</dd></div>)}</dl></details>}
     {!!description.open_non_blocking_questions.length && <><h4>Open optional questions</h4>
       <ul>{description.open_non_blocking_questions.map(q => <li key={q.id}>{q.text}</li>)}</ul></>}
   </div>;
@@ -155,9 +165,24 @@ export function AnalysisPanel({project, onChanged}: {project: Project; onChanged
         if (!e.target.value) { setHistorical(null); return; }
         void run(async () => setHistorical(await api<Analysis>(`/projects/${project.id}/analysis?version=${e.target.value}`)));
       }}><option value="">Current version</option>{versions.map(v => <option key={v.version} value={v.version}>Version {v.version}</option>)}</select></label>
-      <div className="initial-understanding"><h3>1. Initial BA understanding</h3>
-        <p className="muted">This is the agent's initial reading of your requirements. Unconfirmed assumptions are marked below.</p>
-        {shown.initial_description ? <BADescription description={shown.initial_description}/> : <p>{shown.document.overview}</p>}</div>
+      {shown.progress && <div className={`notice ${shown.progress.summary_ready ? '' : 'pending'}`} role="status"><strong>
+        {shown.progress.answered_questions} of {shown.progress.total_questions} clarifications resolved</strong>
+        {shown.progress.blocking_reasons.length > 0 ? <><p>The complete draft is not ready. Remaining work:</p>
+          <ul>{shown.progress.blocking_reasons.map(reason => <li key={reason}>{reason}</li>)}</ul></> :
+          <p>Required clarifications are resolved. The complete description is available below as a draft.</p>}
+      </div>}
+      {!historical && shown.needs_reconciliation && <button disabled={busy} onClick={() => void run(async () => {
+        const updated = await api<Analysis>(`/projects/${project.id}/reconcile`, {expected_version: project.version});
+        setAnalysis(updated); await onChanged();
+      })}>Rebuild description from saved answers</button>}
+      <div className="initial-understanding"><h3>{shown.progress?.summary_ready ? 'Complete BA project description — DRAFT' :
+        shown.answers && Object.keys(shown.answers).length ? 'Working BA description — clarification in progress' : 'Initial BA understanding'}</h3>
+        <p className="muted">Confirmed decisions are included below. Inferred features are listed separately as assumptions.</p>
+        <BADescription description={shown.working_description ?? shown.initial_description}/></div>
+      {!!shown.gap_statuses?.length && <div><h3>Gap resolution</h3>
+        {shown.gap_statuses.map(g => <div className="gap-status" key={g.id}><span className={`badge status-${g.status.toLowerCase()}`}>{g.status.replaceAll('_', ' ')}</span>
+          <p>{g.description}</p>{g.pending_question_ids.length > 0 && <small>Needs: {g.pending_question_ids.join(', ')}</small>}</div>)}
+      </div>}
       {!historical && <><h3>2. Clarification checklist</h3><p className="muted">Up to five questions per batch. Choose options below to refine the description.</p>
         {!shown.questions.length && <p>Required clarifications are complete.</p>}
         {!!shown.questions.length && <QuestionBatch key={`${project.id}-${shown.version}`} questions={shown.questions}
@@ -168,15 +193,16 @@ export function AnalysisPanel({project, onChanged}: {project: Project; onChanged
             save={(id, value) => void run(() => saveAnswers([{question_id: id, value}]))}/>)}
           <p>Changing a conditional parent clears dependent answers and creates a new analysis version.</p>
         </details>}</>}
-      <details><summary>Structured requirements and evidence</summary><p>{shown.document.overview}</p>
+      <details><summary>Initial interpretation (reference)</summary><BADescription description={shown.initial_description}/></details>
+      <details><summary>Traceability and technical evidence</summary>
         {shown.document.requirements.map(r => <div className="requirement" key={r.id}><strong>{r.id} · {r.category} · {r.origin}</strong>
-          <p>{r.text}</p><small>Sources: {r.source_refs.join(', ') || 'Assumption without source'}</small></div>)}
-        <h4>Initial gap and conflict findings</h4>{shown.document.gaps.map((g, i) => <p key={i}><strong>{g.kind}</strong>: {g.description} ({g.question_ids.join(', ')})</p>)}
+          <p>{r.text}</p><small>Sources: {r.source_refs.join(', ') || 'Assumption without source'}</small>
+          {shown.document.grounding_notes?.[r.id] && <p className="assumption">Source review: {shown.document.grounding_notes[r.id]}</p>}</div>)}
         <h4>Source references</h4>{shown.sources.map(s => <details key={s.id}><summary>{s.id} · {s.location}</summary><pre>{s.text}</pre></details>)}
       </details>
-      {shown.markdown && shown.summary && <><h3>3. Complete BA project description</h3>
+      {shown.markdown && shown.summary && <><h3>Download complete draft</h3>
         <p className="notice">Required clarifications resolved. This complete description remains DRAFT for your review.</p>
-        <BADescription description={shown.summary}/><div className="actions">
+        <div className="actions">
         <button onClick={() => download(shown.markdown!, `requirements-v${shown.version}.md`, 'text/markdown')}>Download Markdown</button>
         <button onClick={() => download(JSON.stringify(shown.summary, null, 2), `requirements-v${shown.version}.json`, 'application/json')}>Download JSON</button>
       </div><details><summary>View Markdown source</summary><pre className="summary">{shown.markdown}</pre></details></>}

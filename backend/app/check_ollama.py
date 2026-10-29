@@ -19,7 +19,7 @@ def main() -> int:
     parser.add_argument(
         "--update-probe",
         action="store_true",
-        help="Verify a targeted clarification update with synthetic data",
+        help="Verify deterministic decision incorporation with synthetic data",
     )
     parser.add_argument("--attempts", type=int, choices=[1, 2, 3])
     parser.add_argument(
@@ -33,7 +33,10 @@ def main() -> int:
         settings = settings.model_copy(update={"ollama_max_attempts": args.attempts})
     client = OllamaClient(settings)
     try:
-        print(json.dumps(client.check()), flush=True)
+        if not (
+            args.update_probe and args.no_probe and not args.analysis_probe and not args.model_info
+        ):
+            print(json.dumps(client.check()), flush=True)
         if args.model_info:
             print(json.dumps(client.model_info()), flush=True)
         if not args.no_probe:
@@ -77,7 +80,7 @@ def main() -> int:
                 "id": "R001",
                 "category": "functional",
                 "text": "The login method has not been decided.",
-                "origin": "stated",
+                "origin": "assumption",
                 "source_refs": ["S1"],
             }
             question = {
@@ -99,6 +102,7 @@ def main() -> int:
             graph.invoke(
                 {
                     "document": {
+                        "grounding_reviewed": True,
                         "overview": "A customer portal.",
                         "requirements": [requirement],
                         "gaps": [],
@@ -122,7 +126,7 @@ def main() -> int:
             print(
                 json.dumps(
                     {
-                        "targeted_update_valid": True,
+                        "deterministic_update_valid": True,
                         "summary_status": state["summary"]["status"],
                         "decision_count": len(state["summary"]["clarification_decisions"]),
                         "usage": state["usage"],

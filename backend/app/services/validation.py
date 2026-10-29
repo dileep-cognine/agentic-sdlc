@@ -1,6 +1,27 @@
 from app.analysis_schemas import AnalysisDocument, Answer, AnswerValue, Question, Source
 
 
+def answer_is_decided(value: AnswerValue) -> bool:
+    values = value if isinstance(value, list) else [value]
+    undecided = {
+        "tbd",
+        "not sure",
+        "unknown",
+        "undecided",
+        "not decided",
+        "to be decided",
+        "to be decided later",
+        "decide later",
+        "defer",
+        "deferred",
+    }
+    return bool(values) and all(v.strip().casefold().rstrip(".!?") not in undecided for v in values)
+
+
+def answered(question_id: str, answers: dict) -> bool:
+    return question_id in answers and answer_is_decided(answers[question_id])
+
+
 def validate_sources(document: AnalysisDocument, sources: list[dict]) -> None:
     ids = {Source.model_validate(s).id for s in sources}
     for requirement in document.requirements:
@@ -30,7 +51,9 @@ def required_questions(document: AnalysisDocument, answers: dict) -> set[str]:
         while chain[-1].condition:
             chain.append(by_id[chain[-1].condition.question_id])
         for candidate in reversed(chain):
-            if active(candidate, document.questions, answers) and candidate.id not in answers:
+            if active(candidate, document.questions, answers) and not answered(
+                candidate.id, answers
+            ):
                 needed.add(candidate.id)
                 break
     return needed
@@ -41,7 +64,7 @@ def question_batch(document: AnalysisDocument, answers: dict, size: int = 5) -> 
     pending = [
         q
         for q in document.questions
-        if q.id not in answers and active(q, document.questions, answers)
+        if not answered(q.id, answers) and active(q, document.questions, answers)
     ]
     return sorted(pending, key=lambda q: (q.id not in needed, q.priority, q.id))[:size]
 

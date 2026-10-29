@@ -18,6 +18,7 @@ from app.models import (
     WorkflowCheckpoint,
     now,
 )
+from app.services.business_quality import completion, gap_statuses, review_grounding
 from app.services.document_parser import text_sources
 from app.services.llm import StructuredLLM
 from app.services.validation import (
@@ -98,6 +99,7 @@ def run_analysis(
     expected: int,
     llm: StructuredLLM,
     submission: AnswerSubmission | None = None,
+    reconcile: bool = False,
 ) -> dict:
     """A request owns a project CAS lock until graph+domain commit; failures roll back.
 
@@ -106,7 +108,7 @@ def run_analysis(
     """
     allowed = (
         {WorkflowState.INTAKE}
-        if submission is None
+        if submission is None and not reconcile
         else {WorkflowState.AWAITING_CLARIFICATION, WorkflowState.REQUIREMENTS_REVIEW}
     )
     reserve(db, project, expected, allowed)
@@ -125,7 +127,35 @@ def run_analysis(
     saver = TransactionalSaver(deepcopy(runtime.payload) if runtime else None)
     graph = graph_definition(llm, saver, get_settings().clarification_batch_size)
     config = {"configurable": {"thread_id": project.id}, "recursion_limit": 30}
-    if submission is None:
+    if reconcile:
+        saved = runtime_state(db, project.id)
+        baseline_doc = AnalysisDocument.model_validate(
+            {
+                **saved["document"],
+                "requirements": saved["baseline"],
+                "decision_requirement_ids": {},
+                "grounding_notes": {},
+                "grounding_reviewed": False,
+            }
+        )
+        grounded, grounding_usage = review_grounding(
+            llm, baseline_doc, [s for s in saved["sources"] if not s["id"].startswith("answer:")]
+        )
+        saver = TransactionalSaver()
+        graph = graph_definition(llm, saver, get_settings().clarification_batch_size)
+        graph_input = {
+            **saved,
+            "document": grounded.model_dump(),
+            "baseline": [r.model_dump() for r in grounded.requirements],
+            "usage": saved["usage"] + [grounding_usage.model_dump()],
+            "submission": {
+                "affected": [r.id for r in grounded.requirements],
+                "answers": saved["answers"],
+                "answer_refs": saved["answer_refs"],
+                "sources": saved["sources"],
+            },
+        }
+    elif submission is None:
         graph_input = {
             "sources": source.source_data or text_sources(source.text),
             "submission": None,
@@ -210,7 +240,7 @@ def run_analysis(
     document = AnalysisDocument.model_validate(state["document"])
     target = (
         WorkflowState.AWAITING_CLARIFICATION
-        if required_questions(document, state["answers"])
+        if not document.grounding_reviewed or required_questions(document, state["answers"])
         else WorkflowState.REQUIREMENTS_REVIEW
     )
     validate_transition(WorkflowState.ANALYZING, target)
@@ -259,6 +289,28 @@ def analysis_response(db: Session, project: Project, version: int | None = None)
         )
     )
     initial_description, _ = summary_for(AnalysisDocument.model_validate(initial.document), {})
+    if version is None and document.grounding_reviewed:
+        initial_description, _ = summary_for(
+            AnalysisDocument.model_validate(
+                {
+                    **initial.document,
+                    "requirements": state["baseline"],
+                    "grounding_reviewed": True,
+                    "grounding_notes": document.grounding_notes,
+                }
+            ),
+            {},
+        )
+    working_description, _ = summary_for(document, row.answers)
+    progress = completion(document, row.answers)
+    needs_reconciliation = not document.grounding_reviewed or any(
+        qid not in document.decision_requirement_ids for qid in row.answers
+    )
+    if needs_reconciliation:
+        progress["summary_ready"] = False
+        progress["blocking_reasons"].append(
+            "Rebuild the description to review source support and incorporate saved decisions."
+        )
     return {
         "project_id": project.id,
         "project_version": project.version,
@@ -273,9 +325,13 @@ def analysis_response(db: Session, project: Project, version: int | None = None)
         "source_version": row.source_version,
         "document": row.document,
         "initial_description": initial_description,
+        "working_description": working_description,
         "sources": row.sources,
-        "summary": row.summary,
-        "markdown": row.markdown,
+        "summary": row.summary if progress["summary_ready"] or version is not None else None,
+        "markdown": row.markdown if progress["summary_ready"] or version is not None else None,
+        "gap_statuses": gap_statuses(document, row.answers),
+        "progress": progress,
+        "needs_reconciliation": needs_reconciliation,
         "usage": row.usage,
         "answers": row.answers,
         "questions": [

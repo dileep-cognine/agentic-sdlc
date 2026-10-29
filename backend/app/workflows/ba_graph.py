@@ -9,12 +9,21 @@ from app.analysis_schemas import (
     AnalysisDocument,
     ClarificationDecision,
     DraftSummary,
-    RequirementPatch,
+)
+from app.services.business_quality import (
+    incorporate_decisions,
+    narrative,
+    review_grounding,
 )
 from app.services.llm import StructuredLLM
 from app.services.ollama import LLMError
-from app.services.requirement_updates import PatchValidationError, merge_requirement_patch
-from app.services.validation import active, question_batch, required_questions, validate_sources
+from app.services.validation import (
+    active,
+    answered,
+    question_batch,
+    required_questions,
+    validate_sources,
+)
 from app.workflows.checkpoints import TransactionalSaver
 
 EXTRACTION_PROMPT = """You are a business analyst. Extract every stated business goal, scope,
@@ -35,15 +44,11 @@ preceding questions. Use null when unconditional. Set blocking for decisions nee
 reviewable requirement summary. Write overview as a business analyst narrative describing
 the stated project purpose, users, key journeys and known scope. Keep it factual; do not state
 unresolved decisions as facts. Output all schema fields, including empty lists."""
-
-PATCH_PROMPT = """Update ONLY the supplied affected requirement texts using customer answers.
-Return JSON with requirements: [{id, text, resolved_category}]. Return every supplied ID exactly
-once; never add or delete IDs. Set resolved_category to null for ordinary requirements.
-Only for a baseline category assumption, you may set resolved_category to the proper category
-when an explicit customer answer resolves it. Otherwise keep it null. The backend owns origins
-and citations: do NOT output origin, source_refs or other metadata. Preserve unresolved decisions
-as undecided. Apply all relevant answers without inventing unrelated business decisions.
-No questions, approvals or additional artifacts are requested."""
+EXTRACTION_PROMPT += """ Do not expand a broad capability into assumed features: product management
+does not establish CRUD, browsing does not establish detail pages, and carts do not establish
+editing. Label such suggestions as assumptions. Set decision_category on each question.
+Leave decision_requirement_ids and grounding_notes empty and grounding_reviewed false; these
+are backend-owned. Never write placeholder introductions like 'high-level summary of source S1'."""
 
 
 class GraphState(TypedDict, total=False):
@@ -71,15 +76,26 @@ def summary_for(document: AnalysisDocument, answers: dict) -> tuple[dict, str]:
         "assumption": "Assumptions",
     }
     summary = DraftSummary(
-        project_overview=document.overview,
+        project_overview=narrative(document),
         sections={
-            heading: [r for r in document.requirements if r.category == category]
+            heading: [
+                r
+                for r in document.requirements
+                if r.resolution == "ACTIVE"
+                and (
+                    r.origin == "assumption"
+                    if category == "assumption"
+                    else r.category == category and r.origin != "assumption"
+                )
+            ]
             for category, heading in headings.items()
         },
         open_non_blocking_questions=[
             q
             for q in document.questions
-            if not q.blocking and q.id not in answers and active(q, document.questions, answers)
+            if not q.blocking
+            and not answered(q.id, answers)
+            and active(q, document.questions, answers)
         ],
         clarification_decisions=[
             ClarificationDecision(
@@ -87,6 +103,8 @@ def summary_for(document: AnalysisDocument, answers: dict) -> tuple[dict, str]:
                 question=q.text,
                 answer=answers[q.id],
                 related_requirement_ids=q.related_requirement_ids,
+                status="CONFIRMED" if answered(q.id, answers) else "DEFERRED",
+                requirement_id=document.decision_requirement_ids.get(q.id),
             )
             for q in document.questions
             if q.id in answers and active(q, document.questions, answers)
@@ -111,10 +129,10 @@ def summary_for(document: AnalysisDocument, answers: dict) -> tuple[dict, str]:
             lines.append("Not specified.")
     lines.extend(["", "## Customer clarification decisions", ""])
     for decision in summary.clarification_decisions:
-        answer = (
-            ", ".join(decision.answer) if isinstance(decision.answer, list) else decision.answer
+        lines.append(
+            f"- {decision.question_id} → {decision.requirement_id or 'unresolved'} "
+            f"[{decision.status}]"
         )
-        lines.append(f"- **{decision.question_id}: {decision.question}** {answer}")
     lines.extend(["", "## Open non-blocking questions", ""])
     lines.extend(f"- **{q.id}** {q.text}" for q in summary.open_non_blocking_questions)
     return summary.model_dump(mode="json"), "\n".join(lines)
@@ -132,12 +150,17 @@ def graph_definition(llm: StructuredLLM, saver: TransactionalSaver, batch_size: 
                 raise ValueError("No answers exist at initial extraction")
         except ValueError:
             raise LLMError("invalid_output", "Extraction failed provenance validation.") from None
+        data = document.model_dump()
+        data.update(decision_requirement_ids={}, grounding_notes={}, grounding_reviewed=False)
+        document, grounding_usage = review_grounding(
+            llm, AnalysisDocument.model_validate(data), state["sources"]
+        )
         return {
             "document": document.model_dump(mode="json"),
             "baseline": [r.model_dump() for r in document.requirements],
             "answers": {},
             "answer_refs": {},
-            "usage": [usage.model_dump()],
+            "usage": [usage.model_dump(), grounding_usage.model_dump()],
             "summary": None,
             "markdown": None,
         }
@@ -156,83 +179,21 @@ def graph_definition(llm: StructuredLLM, saver: TransactionalSaver, batch_size: 
     def apply_answers(state: GraphState) -> dict:
         submission = state["submission"]
         document = AnalysisDocument.model_validate(state["document"])
-        affected = set(submission["affected"])
         answers, refs = submission["answers"], submission["answer_refs"]
-        baseline = [r for r in state["baseline"] if r["id"] in affected]
-        relevant = [
-            q
-            for q in document.questions
-            if q.id in answers and affected.intersection(q.related_requirement_ids)
-        ]
-        usage = state["usage"]
-        replacements = baseline
-        if relevant:
-            editable = [
-                r for r in baseline if any(r["id"] in q.related_requirement_ids for q in relevant)
-            ]
-            payload = {
-                "requirements": [{k: r[k] for k in ("id", "category", "text")} for r in editable],
-                "clarifications": [
-                    {"question": q.model_dump(), "answer": answers[q.id]} for q in relevant
-                ],
-            }
-            # One targeted repair for malformed output; never retry a network timeout here.
-            for attempt in range(2):
-                try:
-                    patch, call_usage = llm.generate(RequirementPatch, PATCH_PROMPT, payload)
-                    usage = usage + [call_usage.model_dump()]
-                    merged = merge_requirement_patch(editable, patch, relevant, refs)
-                    by_id = {r["id"]: r for r in merged}
-                    replacements = [by_id.get(r["id"], r) for r in baseline]
-                    break
-                except (PatchValidationError, LLMError) as exc:
-                    if isinstance(exc, LLMError) and exc.code not in {
-                        "invalid_output",
-                        "invalid_json",
-                    }:
-                        raise
-                    reason = str(exc) if isinstance(exc, PatchValidationError) else exc.code
-                    if attempt == 1:
-                        raise LLMError(
-                            "invalid_update",
-                            f"Could not validate the requirement update ({reason}). "
-                            "Your previous saved version is unchanged; retry saving these answers.",
-                        ) from None
-                    payload = {
-                        **payload,
-                        "correction": {
-                            "issue": reason,
-                            "expected_ids": [r["id"] for r in editable],
-                            "instruction": "Preserve IDs; return only update-schema fields.",
-                        },
-                    }
-        try:
-            ids = [r["id"] for r in replacements]
-            if set(ids) != affected or len(ids) != len(set(ids)):
-                raise ValueError("Patch must preserve affected IDs")
-            replacement_map = {r["id"]: r for r in replacements}
-            updated = AnalysisDocument.model_validate(
-                {
-                    **document.model_dump(),
-                    "requirements": [
-                        replacement_map.get(r.id, r.model_dump()) for r in document.requirements
-                    ],
-                }
-            )
-            sources = submission["sources"]
-            validate_sources(updated, sources)
-        except ValueError:
-            raise LLMError(
-                "invalid_update",
-                "The updated requirements have inconsistent IDs or source references. "
-                "Your previous saved version is unchanged.",
-            ) from None
+        sources = submission["sources"]
+        # Customer choices are authoritative facts, not a request for invented rewrites.
+        # Rebuild structured records only; no original document parsing or LLM call.
+        updated = AnalysisDocument.model_validate(
+            {**document.model_dump(), "requirements": state["baseline"]}
+        )
+        updated = incorporate_decisions(updated, state["baseline"], answers, refs)
+        validate_sources(updated, sources)
         return {
             "document": updated.model_dump(mode="json"),
             "answers": answers,
             "answer_refs": refs,
             "sources": sources,
-            "usage": usage,
+            "usage": state["usage"],
             "summary": None,
             "markdown": None,
             "submission": None,
@@ -240,7 +201,11 @@ def graph_definition(llm: StructuredLLM, saver: TransactionalSaver, batch_size: 
 
     def route(state: GraphState) -> str:
         document = AnalysisDocument.model_validate(state["document"])
-        return "clarify" if required_questions(document, state["answers"]) else "summary"
+        return (
+            "clarify"
+            if (not document.grounding_reviewed or required_questions(document, state["answers"]))
+            else "summary"
+        )
 
     def summarize(state: GraphState) -> dict:
         summary, markdown = summary_for(
