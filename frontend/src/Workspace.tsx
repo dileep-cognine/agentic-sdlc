@@ -2,7 +2,8 @@ import { useEffect, useState, type FormEvent } from 'react';
 import { api } from './api';
 import { ClarificationEditor } from './ClarificationEditor';
 import { RequirementsView } from './RequirementsView';
-import { MarkdownDocument } from './MarkdownDocument';
+import { SummaryReview } from './SummaryReview';
+import { WorkflowJourney } from './WorkflowJourney';
 import type { Analysis, Page, Project } from './workspaceTypes';
 
 const pages: Page[] = ['Dashboard', 'Requirements', 'Clarifications', 'Requirement Summary', 'Version History'];
@@ -99,7 +100,7 @@ export function Workspace() {
         {project && <><span className="pill">{friendly(project.state)}</span><span className="version-label">Version {project.version}</span></>}
         {project?.state === 'INTAKE' && <button disabled={busy || !intakes.length} onClick={() => void run(() => action('analyze'))}>Analyze requirements</button>}
         {analysis && <button className="secondary" disabled={busy} onClick={() => setPage(analysis.progress.summary_ready ? 'Requirement Summary' : 'Clarifications')}>
-          {analysis.progress.summary_ready ? 'Review draft' : 'Continue clarification'}</button>}</div></header>
+            {project?.state === 'AWAITING_ARCHITECTURE' ? 'View approved baseline' : analysis.progress.summary_ready ? 'Review draft' : 'Continue clarification'}</button>}</div></header>
       <main className="content-area"><div className="page-title"><div><span className="eyebrow">BUSINESS ANALYST AGENT</span><h2>{page}</h2>
         <p className="subtle">{({Dashboard:'A clear view of your project, decisions, and next steps.', Requirements:'Structured, traceable requirements you can review.',
           Clarifications:'Resolve one decision at a time. Your drafts stay available.', 'Requirement Summary':'Your business document, consolidated from validated decisions.',
@@ -109,7 +110,7 @@ export function Workspace() {
       {busy && <div className="processing" role="status"><span className="spinner"/> Processing and validating · {elapsed}s elapsed. Results are checked before saving.</div>}
       {!project ? <section className="panel empty-state"><h2>Start with a customer requirement</h2><p>Create a project to capture a brief, clarify decisions, and build a reviewable BA document.</p>
         <button onClick={() => setModal(true)}>Create your first project</button></section> : <>
-      {page === 'Dashboard' && <><div className="stat-grid">{[
+      {page === 'Dashboard' && <><WorkflowJourney project={project} analysis={analysis}/><div className="stat-grid">{[
         ['Requirements', analysis?.document.requirements.length ?? 0], ['Open gaps', analysis?.gap_statuses.filter(g => g.status !== 'RESOLVED').length ?? 0],
         ['Answered questions', analysis?.progress.answered_questions ?? 0], ['Workflow stage', friendly(project.state)],
       ].map(([label, value]) => <section className="stat-card" key={label}><span>{label}</span><strong>{value}</strong></section>)}</div>
@@ -132,14 +133,11 @@ export function Workspace() {
       {analysis && <div hidden={page !== 'Clarifications'}><div className="progress-strip"><span>{analysis.progress.answered_questions} / {analysis.progress.total_questions} resolved</span>
         <progress value={analysis.progress.answered_questions} max={analysis.progress.total_questions || 1}/>
         <button className="secondary" disabled={!analysis.progress.summary_ready} onClick={() => setPage('Requirement Summary')}>Continue to summary</button></div>
-        <ClarificationEditor key={project.id} analysis={analysis} busy={busy} submit={body => run(() => action('answers', body), true)}/></div>}
+        {project.state === 'AWAITING_ARCHITECTURE' ? <section className="panel"><h3>Business baseline is approved</h3><p>Clarification edits are locked. The Architecture Agent integration is pending.</p></section> :
+          <ClarificationEditor key={project.id} analysis={analysis} busy={busy} submit={body => run(() => action('answers', body), true)}/>}</div>}
       {page === 'Clarifications' && !analysis && <EmptyAnalysis/>}
-      {page === 'Requirement Summary' && (shown ? <><div className="section-heading"><span className="pill amber">DRAFT</span><div className="actions">
-        <button className="secondary" disabled={!shown.markdown} onClick={() => download(shown.markdown!, `requirements-v${shown.version}.md`, 'text/markdown')}>Download Markdown</button>
-        <button disabled={!shown.summary} onClick={() => download(JSON.stringify(shown.summary,null,2), `requirements-v${shown.version}.json`, 'application/json')}>Export JSON</button></div></div>
-        {!shown.progress.summary_ready && <div className="feedback warning"><strong>Draft is incomplete</strong><ul>{shown.progress.blocking_reasons.map(r => <li key={r}>{r}</li>)}</ul></div>}
-        <section className="panel document-panel">{shown.markdown ? <MarkdownDocument text={shown.markdown}/> : <><h1>Working business requirements</h1><p>{shown.working_description.project_overview}</p>
-          {Object.entries(shown.working_description.sections).filter(([,r]) => r.length).map(([heading, rows]) => <div key={heading}><h2>{heading}</h2><ul>{rows.map(r => <li key={r.id}>{r.text}</li>)}</ul></div>)}</>}</section></> : <EmptyAnalysis/>)}
+      {page === 'Requirement Summary' && (shown ? <SummaryReview project={project} analysis={shown}
+        historical={!!historical} busy={busy} changed={() => refresh(project.id)}/> : <EmptyAnalysis/>)}
       {page === 'Version History' && <div className="history-grid"><section className="panel"><h3>Analysis versions</h3>{versions.map(v => <button className="history-row" key={v.version}
         onClick={() => void run(async () => {const old=await api<Analysis>(`/projects/${project.id}/analysis?version=${v.version}`);setHistorical(old);setPage('Requirement Summary');})}>
         <strong>Version {v.version}</strong><time>{date(v.created_at)}</time><span>View document →</span></button>)}<h3>Intake versions</h3>

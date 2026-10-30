@@ -17,12 +17,16 @@ export function ClarificationEditor({analysis: a, busy, submit}: {analysis: Anal
       {a.answered_questions.map(q => <option key={q.id} value={q.id}>{q.id} · {q.text}</option>)}</select></label></div>;
   const value = values[q.id] ?? a.answers[q.id] ?? (q.type === 'multi_select' ? [] : '');
   const feedback = a.answer_feedback[q.id];
+  const savedDraft = feedback?.reason === 'Draft saved; not submitted for validation.';
+  const answerChanged = JSON.stringify(value) !== JSON.stringify(a.answers[q.id]);
+  const canConfirm = !!feedback && !savedDraft && !answerChanged && ['NEEDS_REVIEW', 'INCOMPLETE'].includes(feedback.status);
   async function save(draft: boolean) {
     setLocalError(''); setDraftSaved(false);
     if (!value.length || typeof value === 'string' && !value.trim()) {setLocalError('Enter an answer before saving.'); return;}
-    if (confirm && !reason.trim()) {setLocalError('Explain why you want to confirm this uncertain decision.'); return;}
+    const confirming = !draft && canConfirm && confirm;
+    if (confirming && !reason.trim()) {setLocalError('Explain why you want to confirm this uncertain decision.'); return;}
     try { await submit({draft, answers: [{question_id: q.id, value, question_version: a.version,
-      confirm, confirmation_reason: reason}]}); setDraftSaved(draft); }
+      confirm: confirming, confirmation_reason: confirming ? reason : ''}]}); setDraftSaved(draft); }
     catch (error) {setLocalError(error instanceof Error ? error.message : 'Could not save. Your text is preserved.');}
   }
   return <div className="clarification-layout"><div className="question-queue" aria-label="Question navigation">
@@ -37,10 +41,11 @@ export function ClarificationEditor({analysis: a, busy, submit}: {analysis: Anal
     <form onSubmit={e => {e.preventDefault(); void save(false);}}><fieldset disabled={busy} aria-describedby={`feedback-${q.id}`}>
       <legend className="sr-only">{q.text}</legend>
       <QuestionControl question={q} value={value} change={v => setValues(old => ({...old, [q.id]: v}))}/>
-      {feedback && <div id={`feedback-${q.id}`} role="status" className={`feedback ${feedback.status === 'VALID' ? 'good' : 'warning'}`}>
-        <strong>{feedback.confirmed_by_customer ? 'Explicitly confirmed · ' : ''}{feedback.status.replaceAll('_', ' ')}</strong>
+      {feedback && !answerChanged && <div id={`feedback-${q.id}`} role="status" className={`feedback ${feedback.status === 'VALID' ? 'good' : 'warning'}`}>
+        <strong>{savedDraft ? 'SAVED DRAFT — NOT VALIDATED' : <>{feedback.confirmed_by_customer ? 'Explicitly confirmed · ' : ''}{feedback.status.replaceAll('_', ' ')}</>}</strong>
         <p>{feedback.reason}</p>{feedback.suggested_clarification && <p>{feedback.suggested_clarification}</p>}</div>}
-      {feedback && ['NEEDS_REVIEW', 'INCOMPLETE'].includes(feedback.status) && <div className="confirmation">
+      {answerChanged && feedback && <p role="status">Answer changed. Validate this version to update its assessment.</p>}
+      {canConfirm && <div className="confirmation">
         <label className="choice"><input type="checkbox" checked={confirm} onChange={e => setConfirm(e.target.checked)}/>
           I explicitly confirm this decision despite the recorded uncertainty.</label>
         {confirm && <label>Confirmation rationale<textarea value={reason} onChange={e => setReason(e.target.value)} maxLength={2000}/></label>}

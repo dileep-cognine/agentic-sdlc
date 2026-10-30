@@ -1,5 +1,8 @@
 # BA workspace review and correction
 
+For the subsequent diagram alignment, summary approval and migration 0004, see
+[Workflow alignment](WORKFLOW_ALIGNMENT.md). The validation policy below still applies.
+
 ## Root causes
 
 - Resolution previously depended on nonempty text and a short undecided-word list.
@@ -24,6 +27,14 @@ entire original document. Each interpreted requirement must cite an exact answer
 Model-created Q&A-template requirements are rejected. New provider names, quantitative targets
 or business decisions must not be invented. Relevant missing details become deduplicated,
 conditional, non-blocking follow-up questions.
+
+Evidence quotations tolerate capitalization and whitespace differences and are restored to
+the actual answer spelling before persistence. Paraphrased or absent quotations trigger one
+targeted model repair for the affected submitted answers only. Unsupported quotations after
+repair still fail validation; no requirement is accepted without answer evidence. Successful
+repair token/latency usage is recorded separately as `answer_evidence_repair`.
+Saved drafts are labelled separately from semantic INCOMPLETE assessments in the editor,
+and cannot activate the uncertainty-confirmation control. Failed validation retains entered text.
 
 Only VALID decisions, or explicitly confirmed INCOMPLETE/NEEDS_REVIEW interpretations,
 can resolve gaps. Confirmation needs a rationale and a grounded interpretation. The original

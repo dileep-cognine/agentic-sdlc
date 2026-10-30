@@ -20,6 +20,9 @@ def test_migration_roundtrip(tmp_path, monkeypatch):
         "analysis_versions",
         "clarification_answers",
         "graph_runtime",
+        "summary_revisions",
+        "requirements_approvals",
+        "architecture_handoffs",
     }
     command.check(config)
     command.downgrade(config, "base")

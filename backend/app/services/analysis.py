@@ -15,7 +15,9 @@ from app.models import (
     ClarificationAnswer,
     GraphRuntime,
     Project,
+    RequirementsApproval,
     RequirementVersion,
+    SummaryRevision,
     WorkflowCheckpoint,
     now,
 )
@@ -367,6 +369,27 @@ def analysis_response(db: Session, project: Project, version: int | None = None)
             {},
         )
     working_description, _ = summary_for(document, row.answers)
+    approval = db.scalar(
+        select(RequirementsApproval).where(
+            RequirementsApproval.project_id == project.id,
+            RequirementsApproval.analysis_version == row.version,
+        )
+    )
+    revision = db.scalar(
+        select(SummaryRevision)
+        .where(
+            SummaryRevision.project_id == project.id,
+            SummaryRevision.analysis_version == row.version,
+        )
+        .order_by(SummaryRevision.revision.desc())
+        .limit(1)
+    )
+    presented_summary = (
+        approval.snapshot["summary"] if approval else revision.content if revision else row.summary
+    )
+    presented_markdown = (
+        approval.markdown if approval else revision.markdown if revision else row.markdown
+    )
     progress = completion(document, row.answers)
     needs_reconciliation = not document.grounding_reviewed or any(
         qid not in document.answer_reviews for qid in row.answers
@@ -392,8 +415,10 @@ def analysis_response(db: Session, project: Project, version: int | None = None)
         "initial_description": initial_description,
         "working_description": working_description,
         "sources": row.sources,
-        "summary": row.summary if progress["summary_ready"] or version is not None else None,
-        "markdown": row.markdown if progress["summary_ready"] or version is not None else None,
+        "summary": presented_summary if progress["summary_ready"] or version is not None else None,
+        "markdown": presented_markdown
+        if progress["summary_ready"] or version is not None
+        else None,
         "gap_statuses": gap_statuses(document, row.answers),
         "progress": progress,
         "needs_reconciliation": needs_reconciliation,

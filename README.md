@@ -1,5 +1,9 @@
 # BA Agent — Phase 2
 
+**Workflow diagram alignment:** see [Workflow alignment](docs/WORKFLOW_ALIGNMENT.md)
+for chunked extraction, editable summary revisions, human business-summary approval,
+the pending architecture handoff, and Docker run commands.
+
 **Current workspace and semantic-validation changes:** see
 [Implementation review](docs/IMPLEMENTATION_REVIEW.md) for the current behavior,
 confirmation policy, migration 0003, file inventory and Windows commands. Historical
@@ -8,8 +12,9 @@ semantic review rather than accepting every nonempty answer.
 
 FastAPI/React modular monolith for versioned business requirement intake, remote
 Ollama analysis, persisted customer clarification and draft JSON/Markdown summaries.
-Phase 1 APIs remain available. No approvals, architecture agent, stories or tasks
-are implemented. Ollama runs exclusively on your existing remote server.
+Phase 1 APIs remain available. Business-summary approval is implemented. Architecture
+execution/approval, stories, tasks and final BA approval remain future work.
+Ollama runs exclusively on your existing remote server.
 
 ## Remote Ollama setup
 
@@ -207,9 +212,10 @@ saved interrupt with LangGraph `Command(resume=...)`.
 Workflow: INTAKE → ANALYZING → AWAITING_CLARIFICATION → ANALYZING →
 REQUIREMENTS_REVIEW. With no blockers, analysis goes directly to review. Editing
 an answer in review returns through ANALYZING and may reopen clarification.
-State transitions are backend-only. No arbitrary transition or approval API is exposed.
-Human approval gates are defined separately from permitted edges; future approval
-handlers must obtain approval from authenticated humans, never model output.
+State transitions are backend-only. No arbitrary transition API is exposed.
+The business-summary approval endpoint requires explicit confirmation and exact revisions;
+model output cannot approve. Reviewer names are currently self-declared; verified identity
+and role authorization remain future work.
 
 Defined states: INTAKE, ANALYZING, AWAITING_CLARIFICATION, REQUIREMENTS_REVIEW,
 AWAITING_ARCHITECTURE, ARCHITECTURE_REVIEW, GENERATING_BA_ARTIFACTS, VALIDATING,
@@ -305,16 +311,17 @@ DOCX tables and paragraphs and PDF page/line references are retained. No OCR:
 scanned/image-only PDFs are rejected when no text is extracted. No raw upload is
 written to application storage. Documents and model output are untrusted data.
 
-Analysis uses an extraction call and a source-support review per document. The remote model must
-have enough context/output capacity; large documents may fail or exceed its
-capacity. Chunked extraction and cross-chunk reconciliation are not implemented.
+Analysis uses bounded chunk extraction, cross-chunk conflict review for multi-chunk documents,
+and a source-support review. The remote model must still have sufficient context/output
+capacity for the consolidated review; chunking does not remove all context limits.
 Semantic correctness still requires customer review: schema/provenance checks
 cannot prove that a model understood every business statement. Invalid model output
 is rejected instead of silently inventing or accepting a repair. The checkpoint
 buffer retains runtime history and may need pruning for long editing histories.
 
-Later phases may add authenticated approval records, architecture integration,
-epics/stories/tasks and artifact quality repairs. None is implemented in Phase 2.
+Later phases may add authenticated reviewer identity, architecture execution,
+epics/stories/tasks and artifact quality repairs. Business approval records and a pending
+architecture handoff are implemented; architecture execution and later artifacts are not.
 
 ## Phase 1 verification record
 

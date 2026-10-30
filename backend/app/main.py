@@ -6,6 +6,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from app.api.analysis import router as analysis_router
 from app.api.projects import router
+from app.api.reviews import router as reviews_router
 from app.body_limit import BodyLimitMiddleware
 from app.config import get_settings
 from app.services.ollama import LLMError
@@ -20,6 +21,7 @@ app.add_middleware(
 )
 app.include_router(router, prefix="/api")
 app.include_router(analysis_router, prefix="/api")
+app.include_router(reviews_router, prefix="/api")
 
 
 @app.exception_handler(LLMError)

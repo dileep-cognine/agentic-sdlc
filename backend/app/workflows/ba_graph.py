@@ -16,6 +16,7 @@ from app.services.business_quality import (
     narrative,
     review_grounding,
 )
+from app.services.chunked_analysis import extract_chunked
 from app.services.llm import StructuredLLM
 from app.services.ollama import LLMError
 from app.services.validation import (
@@ -144,11 +145,11 @@ def summary_for(document: AnalysisDocument, answers: dict) -> tuple[dict, str]:
 def graph_definition(llm: StructuredLLM, saver: TransactionalSaver, batch_size: int = 5):
     def extract(state: GraphState) -> dict:
         llm.check()
-        document, usage = llm.generate(
-            AnalysisDocument, EXTRACTION_PROMPT, {"sources": state["sources"]}
+        document, sources, extraction_usage = extract_chunked(
+            llm, state["sources"], EXTRACTION_PROMPT
         )
         try:
-            validate_sources(document, state["sources"])
+            validate_sources(document, sources)
             if any(r.origin == "customer_answer" for r in document.requirements):
                 raise ValueError("No answers exist at initial extraction")
         except ValueError:
@@ -162,15 +163,16 @@ def graph_definition(llm: StructuredLLM, saver: TransactionalSaver, batch_size: 
             grounding_reviewed=False,
         )
         document, grounding_usage = review_grounding(
-            llm, AnalysisDocument.model_validate(data), state["sources"]
+            llm, AnalysisDocument.model_validate(data), sources
         )
         return {
             "document": document.model_dump(mode="json"),
+            "sources": sources,
             "baseline": [r.model_dump() for r in document.requirements],
             "answers": {},
             "answer_refs": {},
             "usage": [
-                {**usage.model_dump(), "operation": "extraction"},
+                *extraction_usage,
                 {**grounding_usage.model_dump(), "operation": "source_review"},
             ],
             "summary": None,

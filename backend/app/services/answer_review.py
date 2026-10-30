@@ -1,5 +1,7 @@
 """Question-specific semantic checks and grounded, atomic interpretations."""
 
+import re
+
 from app.analysis_schemas import (
     AnalysisDocument,
     Answer,
@@ -30,6 +32,33 @@ confirmed_by_customer is always false in your response; only the backend may gra
 Never approve a project or change workflow state. Return exactly one result per submitted ID."""
 
 
+def grounded_excerpt(excerpt: str, sources: list[str]) -> str | None:
+    """Restore actual source spelling; tolerate case and whitespace, never paraphrases."""
+    words = excerpt.split()
+    if not words:
+        return None
+    pattern = re.compile(r"\s+".join(re.escape(word) for word in words), re.IGNORECASE)
+    for source in sources:
+        match = pattern.search(source)
+        if match:
+            return match.group()
+    return None
+
+
+def evidence_errors(assessment: AnswerAssessment, answer: Answer) -> bool:
+    sources = answer.value if isinstance(answer.value, list) else [answer.value]
+    if answer.confirm and answer.confirmation_reason:
+        sources = [*sources, answer.confirmation_reason]
+    invalid = False
+    for requirement in assessment.requirements:
+        quoted = grounded_excerpt(requirement.source_excerpt, sources)
+        if quoted is None:
+            invalid = True
+        else:
+            requirement.source_excerpt = quoted
+    return invalid
+
+
 def assess_answers(
     llm: StructuredLLM, document: AnalysisDocument, submitted: list[Answer], draft: bool = False
 ) -> tuple[dict, list[dict]]:
@@ -46,40 +75,73 @@ def assess_answers(
             for a in submitted
         }, []
     by_id = {q.id: q for q in document.questions}
+    payload = {
+        "answers": [
+            {
+                "question": by_id[a.question_id].model_dump(),
+                "answer": a.value,
+                "confirmation_reason": a.confirmation_reason if a.confirm else "",
+            }
+            for a in submitted
+        ],
+        "existing_questions": [{"id": q.id, "text": q.text} for q in document.questions],
+        "existing_requirement_keys": list(document.decision_claim_ids),
+    }
     result, usage = llm.generate(
         AnswerReviewBatch,
         PROMPT,
-        {
-            "answers": [
-                {
-                    "question": by_id[a.question_id].model_dump(),
-                    "answer": a.value,
-                    "confirmation_reason": a.confirmation_reason if a.confirm else "",
-                }
-                for a in submitted
-            ],
-            "existing_questions": [{"id": q.id, "text": q.text} for q in document.questions],
-            "existing_requirement_keys": list(document.decision_claim_ids),
-        },
+        payload,
     )
+    calls = [{**usage.model_dump(), "operation": "answer_review"}]
     ids = [r.question_id for r in result.assessments]
     if len(ids) != len(set(ids)) or set(ids) != {a.question_id for a in submitted}:
         raise LLMError(
             "invalid_answer_review", "The answer review did not cover the submitted questions."
         )
     answers = {a.question_id: a for a in submitted}
+    invalid = {
+        assessment.question_id
+        for assessment in result.assessments
+        if evidence_errors(assessment, answers[assessment.question_id])
+    }
+    if invalid:
+        # One bounded repair, limited to the submitted answers with invalid quotations.
+        repaired, repair_usage = llm.generate(
+            AnswerReviewBatch,
+            PROMPT + " Your previous review quoted evidence absent from the answer. "
+            "Reassess only these answers. Copy source_excerpt verbatim from the answer, "
+            "not from your interpreted requirement. Do not add facts to make evidence fit.",
+            {
+                **payload,
+                "answers": [
+                    item for item in payload["answers"] if item["question"]["id"] in invalid
+                ],
+            },
+        )
+        calls.append({**repair_usage.model_dump(), "operation": "answer_evidence_repair"})
+        repaired_ids = [item.question_id for item in repaired.assessments]
+        if len(repaired_ids) != len(set(repaired_ids)) or set(repaired_ids) != invalid:
+            raise LLMError(
+                "invalid_answer_review", "The repaired review omitted submitted answers."
+            )
+        replacements = {item.question_id: item for item in repaired.assessments}
+        result.assessments = [
+            replacements.get(item.question_id, item) for item in result.assessments
+        ]
     reviews = {}
     for assessment in result.assessments:
         answer = answers[assessment.question_id]
-        evidence = "\n".join(answer.value) if isinstance(answer.value, list) else answer.value
-        if answer.confirm:
-            evidence += "\n" + answer.confirmation_reason
         keys = [r.key for r in assessment.requirements]
-        if len(keys) != len(set(keys)) or any(
-            r.source_excerpt not in evidence for r in assessment.requirements
-        ):
+        if len(keys) != len(set(keys)):
             raise LLMError(
-                "invalid_answer_review", "The interpretation lacks valid answer evidence."
+                "invalid_answer_review", "The model returned duplicate requirement keys."
+            )
+        if evidence_errors(assessment, answer):
+            raise LLMError(
+                "invalid_answer_review",
+                "The model could not quote supporting evidence from your answer after one repair. "
+                "Your answer has not been validated and your text is preserved. "
+                "Retry validation; you do not need to confirm uncertainty to bypass this error.",
             )
         assessment.confirmed_by_customer = False
         assessment.confirmation_requested = answer.confirm
@@ -108,7 +170,7 @@ def assess_answers(
                 "The interpretation must contain atomic requirements, not a repeated Q&A.",
             )
         reviews[assessment.question_id] = assessment.model_dump()
-    return reviews, [{**usage.model_dump(), "operation": "answer_review"}]
+    return reviews, calls
 
 
 def add_followups(document: AnalysisDocument, answers: dict) -> AnalysisDocument:

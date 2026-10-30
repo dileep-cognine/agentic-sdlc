@@ -89,3 +89,40 @@ class AnswerValidationEvent(Base):
     value: Mapped[str | list[str]] = mapped_column(JSON)
     assessment: Mapped[dict] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class SummaryRevision(Base):
+    __tablename__ = "summary_revisions"
+    __table_args__ = (UniqueConstraint("project_id", "analysis_version", "revision"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    analysis_version: Mapped[int] = mapped_column(Integer)
+    revision: Mapped[int] = mapped_column(Integer)
+    content: Mapped[dict] = mapped_column(JSON)
+    markdown: Mapped[str] = mapped_column(Text)
+    reviewer: Mapped[str] = mapped_column(String(200))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class RequirementsApproval(Base):
+    __tablename__ = "requirements_approvals"
+    __table_args__ = (UniqueConstraint("project_id", "analysis_version"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    analysis_version: Mapped[int] = mapped_column(Integer)
+    summary_revision: Mapped[int] = mapped_column(Integer)
+    reviewer: Mapped[str] = mapped_column(String(200))
+    content_hash: Mapped[str] = mapped_column(String(64))
+    snapshot: Mapped[dict] = mapped_column(JSON)
+    markdown: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class ArchitectureHandoff(Base):
+    __tablename__ = "architecture_handoffs"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    approval_id: Mapped[str] = mapped_column(ForeignKey("requirements_approvals.id"), unique=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    status: Mapped[str] = mapped_column(String(50), default="PENDING_INTEGRATION")
+    payload: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)

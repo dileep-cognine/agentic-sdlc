@@ -204,7 +204,8 @@ class ClarificationDecision(StrictModel):
 
 
 class DraftSummary(StrictModel):
-    status: Literal["DRAFT"] = "DRAFT"
+    status: Literal["DRAFT", "APPROVED"] = "DRAFT"
+    review_notes: str = ""
     project_overview: str
     sections: dict[str, list[ExtractedRequirement]]
     open_non_blocking_questions: list[Question]

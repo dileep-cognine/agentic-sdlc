@@ -4,6 +4,23 @@ import { ClarificationEditor, QuestionControl } from './ClarificationEditor';
 import { MarkdownDocument } from './MarkdownDocument';
 import type { Analysis, Question } from './workspaceTypes';
 afterEach(cleanup);
+it('labels a saved draft separately from semantic uncertainty',()=>{
+  const a=data();a.answers={Q001:'Customers use email and password.'};
+  a.answer_feedback={Q001:{status:'INCOMPLETE',reason:'Draft saved; not submitted for validation.',
+    suggested_clarification:'Submit when ready.',confirmed_by_customer:false,confirmation_reason:''}};
+  render(<ClarificationEditor analysis={a} busy={false} submit={vi.fn()}/>);
+  expect(screen.getByText('SAVED DRAFT — NOT VALIDATED')).toBeTruthy();
+  expect(screen.queryByRole('checkbox')).toBeNull();
+});
+
+it('preserves answer text and displays model validation errors',async()=>{
+  const submit=vi.fn().mockRejectedValue(new Error('The model could not quote supporting evidence.'));
+  render(<ClarificationEditor analysis={data()} busy={false} submit={submit}/>);
+  fireEvent.change(screen.getByLabelText('Your answer'),{target:{value:'Customers use email and password.'}});
+  fireEvent.click(screen.getByRole('button',{name:'Validate and continue'}));
+  expect(await screen.findByRole('alert')).toBeTruthy();
+  expect((screen.getByLabelText('Your answer') as HTMLTextAreaElement).value).toBe('Customers use email and password.');
+});
 const question: Question={id:'Q001',text:'How should customers authenticate?',type:'free_text',options:[],blocking:true,priority:1,related_requirement_ids:['R001'],condition:null};
 function data(): Analysis{return {version:3,document:{questions:[question],requirements:[]},questions:[question],answered_questions:[],answers:{},answer_feedback:{}} as unknown as Analysis;}
 it('preserves entered text when a semantic review is unclear',async()=>{
