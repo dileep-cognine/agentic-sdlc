@@ -7,10 +7,11 @@ from langgraph.types import Command
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
-from app.analysis_schemas import AnalysisDocument, AnswerSubmission
+from app.analysis_schemas import AnalysisDocument, Answer, AnswerSubmission
 from app.config import get_settings
 from app.models import (
     AnalysisVersion,
+    AnswerValidationEvent,
     ClarificationAnswer,
     GraphRuntime,
     Project,
@@ -18,6 +19,7 @@ from app.models import (
     WorkflowCheckpoint,
     now,
 )
+from app.services.answer_review import assess_answers
 from app.services.business_quality import completion, gap_statuses, review_grounding
 from app.services.document_parser import text_sources
 from app.services.llm import StructuredLLM
@@ -141,6 +143,31 @@ def run_analysis(
         grounded, grounding_usage = review_grounding(
             llm, baseline_doc, [s for s in saved["sources"] if not s["id"].startswith("answer:")]
         )
+        reviews = {
+            k: v.model_dump() for k, v in grounded.answer_reviews.items() if k in saved["answers"]
+        }
+        review_usage = []
+        saved_answers = [
+            Answer(question_id=qid, value=value)
+            for qid, value in saved["answers"].items()
+            if qid not in reviews
+        ]
+        for offset in range(0, len(saved_answers), 5):
+            batch_reviews, batch_usage = assess_answers(
+                llm, grounded, saved_answers[offset : offset + 5]
+            )
+            reviews.update(batch_reviews)
+            review_usage.extend(batch_usage)
+            for item in saved_answers[offset : offset + 5]:
+                db.add(
+                    AnswerValidationEvent(
+                        project_id=project.id,
+                        question_id=item.question_id,
+                        analysis_version=analysis_version,
+                        value=item.value,
+                        assessment=reviews[item.question_id],
+                    )
+                )
         saver = TransactionalSaver()
         graph = graph_definition(llm, saver, get_settings().clarification_batch_size)
         graph_input = {
@@ -153,6 +180,8 @@ def run_analysis(
                 "answers": saved["answers"],
                 "answer_refs": saved["answer_refs"],
                 "sources": saved["sources"],
+                "answer_reviews": reviews,
+                "usage": review_usage,
             },
         }
     elif submission is None:
@@ -163,6 +192,11 @@ def run_analysis(
     else:
         state = graph.get_state(config).values
         document = AnalysisDocument.model_validate(state["document"])
+        if any(
+            a.question_version is not None and a.question_version != previous.version
+            for a in submission.answers
+        ):
+            raise HTTPException(409, "Question version changed; refresh before submitting")
         try:
             validate_answers(document, state["answers"], submission.answers)
         except ValueError as exc:
@@ -177,12 +211,32 @@ def run_analysis(
         if any(a.question_id not in visible | set(state["answers"]) for a in submission.answers):
             raise HTTPException(422, "Answer questions from the current batch")
         changed = {a.question_id for a in submission.answers}
+        if all(
+            a.value == state["answers"].get(a.question_id)
+            and not a.confirm
+            and document.answer_reviews.get(a.question_id)
+            and document.answer_reviews[a.question_id].reason
+            != "Draft saved; not submitted for validation."
+            for a in submission.answers
+        ):
+            raise HTTPException(
+                409, "These answers are already saved; edit them before resubmitting"
+            )
         invalidated = invalidate_descendants(document, state["answers"], set(changed))
         if invalidated & changed:
             raise HTTPException(
                 422, "Save a changed parent before answering its dependent questions"
             )
         effective = {k: v for k, v in state["answers"].items() if k not in invalidated}
+        reviews = {
+            k: v.model_dump()
+            for k, v in document.answer_reviews.items()
+            if k not in invalidated | changed
+        }
+        new_reviews, review_usage = assess_answers(
+            llm, document, submission.answers, submission.draft
+        )
+        reviews.update(new_reviews)
         refs = {k: v for k, v in state["answer_refs"].items() if k not in invalidated}
         old_refs = {
             state["answer_refs"][k] for k in changed | invalidated if k in state["answer_refs"]
@@ -219,6 +273,15 @@ def run_analysis(
                     value=answer.value,
                 )
             )
+            db.add(
+                AnswerValidationEvent(
+                    project_id=project.id,
+                    question_id=answer.question_id,
+                    analysis_version=analysis_version,
+                    value=answer.value,
+                    assessment=new_reviews[answer.question_id],
+                )
+            )
         affected = {
             r
             for q in document.questions
@@ -230,6 +293,8 @@ def run_analysis(
             "answers": effective,
             "answer_refs": refs,
             "sources": sources,
+            "answer_reviews": reviews,
+            "usage": review_usage,
         }
         if graph.get_state(config).next:
             graph_input = Command(resume=answer_input)
@@ -304,7 +369,7 @@ def analysis_response(db: Session, project: Project, version: int | None = None)
     working_description, _ = summary_for(document, row.answers)
     progress = completion(document, row.answers)
     needs_reconciliation = not document.grounding_reviewed or any(
-        qid not in document.decision_requirement_ids for qid in row.answers
+        qid not in document.answer_reviews for qid in row.answers
     )
     if needs_reconciliation:
         progress["summary_ready"] = False
@@ -332,6 +397,7 @@ def analysis_response(db: Session, project: Project, version: int | None = None)
         "gap_statuses": gap_statuses(document, row.answers),
         "progress": progress,
         "needs_reconciliation": needs_reconciliation,
+        "answer_feedback": {k: v.model_dump() for k, v in document.answer_reviews.items()},
         "usage": row.usage,
         "answers": row.answers,
         "questions": [

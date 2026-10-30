@@ -6,7 +6,7 @@ from copy import deepcopy
 from app.analysis_schemas import AnalysisDocument, GroundingReview
 from app.services.llm import StructuredLLM
 from app.services.ollama import LLMError
-from app.services.validation import active, answered, required_questions
+from app.services.validation import active, answer_is_decided, answered, required_questions
 
 GROUNDING_PROMPT = """Independently review every extracted requirement against the provided sources.
 Return one assessment per requirement ID. supported=true only when the source explicitly states
@@ -74,72 +74,90 @@ def narrative(document: AnalysisDocument) -> str:
 def incorporate_decisions(
     document: AnalysisDocument, baseline: list[dict], answers: dict, refs: dict[str, str]
 ) -> AnalysisDocument:
-    """Every active confirmed choice becomes a separate stable, verbatim business decision.
-
-    This is deterministic rendering of customer input, not invented LLM reasoning.
-    Existing generic requirements never serve as the sole evidence of incorporation.
-    """
+    """Create atomic requirements only from accepted, evidence-checked interpretations."""
     data = deepcopy(document.model_dump())
-    mapping = data["decision_requirement_ids"]
-    if not mapping:
-        occupied = {r["id"] for r in baseline}
-        cursor = 1
-        for question in document.questions:
-            while f"R{cursor:03}" in occupied:
-                cursor += 1
-            mapping[question.id] = f"R{cursor:03}"
-            occupied.add(mapping[question.id])
-    generated_ids = set(mapping.values())
-    data["requirements"] = [r for r in data["requirements"] if r["id"] not in generated_ids]
+    occupied = (
+        {r["id"] for r in baseline}
+        | set(data["decision_claim_ids"].values())
+        | set(data["decision_requirement_ids"].values())
+    )
+    data["requirements"] = deepcopy(baseline)
     for requirement in data["requirements"]:
-        related = [q for q in document.questions if requirement["id"] in q.related_requirement_ids]
+        related = [
+            q
+            for q in document.questions
+            if requirement["id"] in q.related_requirement_ids and q.blocking
+        ]
         if (
             requirement["origin"] == "assumption"
             and related
             and any(
                 term in requirement["text"].casefold()
-                for term in ("undecided", "not decided", "not been decided", "not specified")
+                for term in ("undecided", "not specified", "not decided", "not been decided")
             )
             and all(
-                not active(q, document.questions, answers) or answered(q.id, answers)
+                not active(q, document.questions, answers, document.answer_reviews)
+                or answered(q.id, answers, document.answer_reviews)
                 for q in related
             )
         ):
             requirement["resolution"] = "SUPERSEDED"
+    cursor = 1
     for question in document.questions:
-        if not active(question, document.questions, answers) or not answered(question.id, answers):
+        if not active(
+            question, document.questions, answers, document.answer_reviews
+        ) or not answered(question.id, answers, document.answer_reviews):
             continue
-        value = answers[question.id]
-        text = "; ".join(value) if isinstance(value, list) else value
-        category = question.decision_category
-        if any(g.kind == "security" and question.id in g.question_ids for g in document.gaps):
-            category = "non_functional"
-        if category == "assumption":
-            category = "business_rule"
-        data["requirements"].append(
-            {
-                "id": mapping[question.id],
-                "category": category,
-                "text": f"Customer decision — {question.text} Selected answer: {text}",
-                "origin": "customer_answer",
-                "source_refs": [refs[question.id]],
-            }
-        )
-    data["decision_requirement_ids"] = mapping
-    result = AnalysisDocument.model_validate(data)
-    # Validate real answer content, not just labels or citations.
-    by_id = {r.id: r for r in result.requirements}
-    for q in result.questions:
-        if active(q, result.questions, answers) and answered(q.id, answers):
-            requirement = by_id.get(mapping[q.id])
-            values = answers[q.id] if isinstance(answers[q.id], list) else [answers[q.id]]
-            if not requirement or any(
-                normalized(v) not in normalized(requirement.text) for v in values
-            ):
-                raise LLMError(
-                    "missing_answer_content", "A customer decision is absent from the requirements."
+        assessment = document.answer_reviews[question.id]
+        for index, claim in enumerate(assessment.requirements):
+            key = question.id + ":" + claim.key
+            duplicate = next(
+                (
+                    r
+                    for r in data["requirements"]
+                    if normalized(r["text"]) == normalized(claim.text)
+                    and r["category"] == claim.category
+                ),
+                None,
+            )
+            if duplicate:
+                duplicate["origin"] = "customer_answer"
+                duplicate["resolution"] = "ACTIVE"
+                duplicate["source_refs"] = list(
+                    dict.fromkeys([*duplicate["source_refs"], refs[question.id]])
                 )
-    return result
+                data["decision_claim_ids"][key] = duplicate["id"]
+                if index == 0:
+                    data["decision_requirement_ids"][question.id] = duplicate["id"]
+                continue
+            rid = data["decision_claim_ids"].get(key)
+            if rid and any(r["id"] == rid for r in data["requirements"]):
+                rid = None
+            if not rid:
+                legacy = data["decision_requirement_ids"].get(question.id)
+                if legacy and not any(
+                    k.startswith(question.id + ":") for k in data["decision_claim_ids"]
+                ):
+                    rid = legacy
+                else:
+                    while f"R{cursor:03}" in occupied:
+                        cursor += 1
+                    rid = f"R{cursor:03}"
+                occupied.add(rid)
+                data["decision_claim_ids"][key] = rid
+            if index == 0:
+                data["decision_requirement_ids"][question.id] = rid
+            data["requirements"].append(
+                {
+                    "id": rid,
+                    "title": claim.title,
+                    "text": claim.text,
+                    "category": claim.category,
+                    "origin": "customer_answer",
+                    "source_refs": [refs[question.id]],
+                }
+            )
+    return AnalysisDocument.model_validate(data)
 
 
 def gap_statuses(document: AnalysisDocument, answers: dict) -> list[dict]:
@@ -147,11 +165,13 @@ def gap_statuses(document: AnalysisDocument, answers: dict) -> list[dict]:
     for index, gap in enumerate(document.gaps, 1):
         ids = set(gap.question_ids)
         for q in document.questions:
-            if q.condition and q.condition.question_id in ids:
+            if q.condition and q.blocking and q.condition.question_id in ids:
                 ids.add(q.id)
         questions = [q for q in document.questions if q.id in ids]
-        applicable = [q for q in questions if active(q, document.questions, answers)]
-        pending = [q.id for q in applicable if not answered(q.id, answers)]
+        applicable = [
+            q for q in questions if active(q, document.questions, answers, document.answer_reviews)
+        ]
+        pending = [q.id for q in applicable if not answered(q.id, answers, document.answer_reviews)]
         deferred = [qid for qid in pending if qid in answers]
         if not applicable:
             by_id = {q.id: q for q in document.questions}
@@ -159,18 +179,29 @@ def gap_statuses(document: AnalysisDocument, answers: dict) -> list[dict]:
             for q in questions:
                 while q.condition:
                     q = by_id[q.condition.question_id]
-                    if not answered(q.id, answers):
+                    if not answered(q.id, answers, document.answer_reviews):
                         waiting.add(q.id)
-            status = "UNANSWERED" if waiting else "NOT_APPLICABLE"
+            status = "OPEN" if waiting else "RESOLVED"
             pending = sorted(waiting)
         elif not pending:
             status = "RESOLVED"
-        elif deferred:
+        elif any(
+            qid in document.answer_reviews
+            and document.answer_reviews[qid].status in {"UNCLEAR", "CONTRADICTORY", "NEEDS_REVIEW"}
+            for qid in pending
+        ):
+            status = "ANSWER_NEEDS_CLARIFICATION"
+        elif any(
+            not answer_is_decided(answers[qid])
+            or document.answer_reviews.get(qid)
+            and document.answer_reviews[qid].reason.startswith("Draft saved")
+            for qid in deferred
+        ):
             status = "DEFERRED"
-        elif len(pending) != len(applicable):
-            status = "PARTIAL"
+        elif deferred:
+            status = "ANSWER_NEEDS_CLARIFICATION"
         else:
-            status = "UNANSWERED"
+            status = "AWAITING_ANSWER"
         rows.append(
             {
                 "id": f"G{index:03}",
@@ -188,7 +219,8 @@ def completion(document: AnalysisDocument, answers: dict) -> dict:
     return {
         "total_questions": len(document.questions),
         "answered_questions": sum(
-            active(q, document.questions, answers) and answered(q.id, answers)
+            active(q, document.questions, answers, document.answer_reviews)
+            and answered(q.id, answers, document.answer_reviews)
             for q in document.questions
         ),
         "remaining_required_question_ids": sorted(remaining),

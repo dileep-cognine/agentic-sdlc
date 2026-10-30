@@ -13,6 +13,7 @@ def test_migration_roundtrip(tmp_path, monkeypatch):
     command.upgrade(config, "head")
     assert set(inspect(engine).get_table_names()) == {
         "alembic_version",
+        "answer_validation_events",
         "projects",
         "requirement_versions",
         "workflow_checkpoints",

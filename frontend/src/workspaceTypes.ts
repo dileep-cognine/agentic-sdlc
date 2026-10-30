@@ -1,0 +1,17 @@
+export type Page = 'Dashboard' | 'Requirements' | 'Clarifications' | 'Requirement Summary' | 'Version History';
+export type Project = {id: string; name: string; description: string; state: string; version: number};
+export type Value = string | string[];
+export type Question = {id: string; text: string; type: string; options: string[]; blocking: boolean;
+  priority: number; related_requirement_ids: string[]; condition: unknown; why_it_matters?: string};
+export type Review = {status: string; reason: string; suggested_clarification: string;
+  confirmed_by_customer: boolean; confirmation_reason: string};
+export type Requirement = {id: string; title: string; text: string; category: string; origin: string;
+  classification: string; resolution: string; source_refs: string[]};
+export type Analysis = {version: number; state: string; document: {requirements: Requirement[]; questions: Question[]};
+  questions: Question[]; answered_questions: Question[]; answers: Record<string, Value>;
+  answer_feedback: Record<string, Review>; markdown: string | null; summary: unknown;
+  working_description: {project_overview: string; sections: Record<string, Requirement[]>};
+  needs_reconciliation: boolean; progress: {total_questions: number; answered_questions: number;
+    blocking_reasons: string[]; summary_ready: boolean};
+  gap_statuses: {id: string; description: string; status: string; question_ids?: string[]}[];
+  usage: {operation: string; input_tokens: number; output_tokens: number; latency_ms: number; attempts: number}[]};

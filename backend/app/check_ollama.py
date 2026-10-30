@@ -3,8 +3,10 @@
 import argparse
 import json
 
+from app.analysis_schemas import AnalysisDocument, Answer
 from app.api.analysis import CompatibilityProbe
 from app.config import Settings
+from app.services.answer_review import assess_answers
 from app.services.document_parser import text_sources
 from app.services.ollama import LLMError, OllamaClient
 from app.workflows.ba_graph import graph_definition
@@ -19,7 +21,7 @@ def main() -> int:
     parser.add_argument(
         "--update-probe",
         action="store_true",
-        help="Verify deterministic decision incorporation with synthetic data",
+        help="Verify semantic answer validation and atomic requirements with synthetic data",
     )
     parser.add_argument("--attempts", type=int, choices=[1, 2, 3])
     parser.add_argument(
@@ -87,7 +89,7 @@ def main() -> int:
                 "id": "Q001",
                 "text": "Which login method is required?",
                 "type": "single_select",
-                "options": ["Email", "SSO"],
+                "options": ["Email and password", "SSO"],
                 "blocking": True,
                 "priority": 1,
                 "related_requirement_ids": ["R001"],
@@ -95,8 +97,24 @@ def main() -> int:
             }
             sources = [
                 {"id": "S1", "location": "Synthetic input", "text": requirement["text"]},
-                {"id": "answer:Q001:v1", "location": "Synthetic answer", "text": "Email"},
+                {
+                    "id": "answer:Q001:v1",
+                    "location": "Synthetic answer",
+                    "text": "Email and password",
+                },
             ]
+            probe_doc = AnalysisDocument.model_validate(
+                {
+                    "overview": "A customer portal.",
+                    "requirements": [requirement],
+                    "questions": [question],
+                    "gaps": [],
+                    "grounding_reviewed": True,
+                }
+            )
+            reviews, review_usage = assess_answers(
+                client, probe_doc, [Answer(question_id="Q001", value="Email and password")]
+            )
             graph = graph_definition(client, TransactionalSaver())
             config = {"configurable": {"thread_id": "update-compatibility-probe"}}
             graph.invoke(
@@ -115,7 +133,9 @@ def main() -> int:
                     "answer_refs": {},
                     "submission": {
                         "affected": ["R001"],
-                        "answers": {"Q001": "Email"},
+                        "answers": {"Q001": "Email and password"},
+                        "answer_reviews": reviews,
+                        "usage": review_usage,
                         "answer_refs": {"Q001": "answer:Q001:v1"},
                         "sources": sources,
                     },
@@ -126,9 +146,11 @@ def main() -> int:
             print(
                 json.dumps(
                     {
-                        "deterministic_update_valid": True,
-                        "summary_status": state["summary"]["status"],
-                        "decision_count": len(state["summary"]["clarification_decisions"]),
+                        "answer_status": reviews["Q001"]["status"],
+                        "summary_status": state.get("summary", {}).get("status")
+                        if state.get("summary")
+                        else None,
+                        "requirement_count": len(state["document"]["requirements"]),
                         "usage": state["usage"],
                     }
                 ),

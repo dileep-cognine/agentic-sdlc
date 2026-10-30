@@ -10,6 +10,7 @@ from app.analysis_schemas import (
     ClarificationDecision,
     DraftSummary,
 )
+from app.services.answer_review import add_followups
 from app.services.business_quality import (
     incorporate_decisions,
     narrative,
@@ -94,8 +95,8 @@ def summary_for(document: AnalysisDocument, answers: dict) -> tuple[dict, str]:
             q
             for q in document.questions
             if not q.blocking
-            and not answered(q.id, answers)
-            and active(q, document.questions, answers)
+            and not answered(q.id, answers, document.answer_reviews)
+            and active(q, document.questions, answers, document.answer_reviews)
         ],
         clarification_decisions=[
             ClarificationDecision(
@@ -103,11 +104,13 @@ def summary_for(document: AnalysisDocument, answers: dict) -> tuple[dict, str]:
                 question=q.text,
                 answer=answers[q.id],
                 related_requirement_ids=q.related_requirement_ids,
-                status="CONFIRMED" if answered(q.id, answers) else "DEFERRED",
+                status="CONFIRMED"
+                if answered(q.id, answers, document.answer_reviews)
+                else "DEFERRED",
                 requirement_id=document.decision_requirement_ids.get(q.id),
             )
             for q in document.questions
-            if q.id in answers and active(q, document.questions, answers)
+            if q.id in answers and active(q, document.questions, answers, document.answer_reviews)
         ],
     )
     lines = [
@@ -151,7 +154,13 @@ def graph_definition(llm: StructuredLLM, saver: TransactionalSaver, batch_size: 
         except ValueError:
             raise LLMError("invalid_output", "Extraction failed provenance validation.") from None
         data = document.model_dump()
-        data.update(decision_requirement_ids={}, grounding_notes={}, grounding_reviewed=False)
+        data.update(
+            decision_requirement_ids={},
+            decision_claim_ids={},
+            answer_reviews={},
+            grounding_notes={},
+            grounding_reviewed=False,
+        )
         document, grounding_usage = review_grounding(
             llm, AnalysisDocument.model_validate(data), state["sources"]
         )
@@ -160,7 +169,10 @@ def graph_definition(llm: StructuredLLM, saver: TransactionalSaver, batch_size: 
             "baseline": [r.model_dump() for r in document.requirements],
             "answers": {},
             "answer_refs": {},
-            "usage": [usage.model_dump(), grounding_usage.model_dump()],
+            "usage": [
+                {**usage.model_dump(), "operation": "extraction"},
+                {**grounding_usage.model_dump(), "operation": "source_review"},
+            ],
             "summary": None,
             "markdown": None,
         }
@@ -186,6 +198,10 @@ def graph_definition(llm: StructuredLLM, saver: TransactionalSaver, batch_size: 
         updated = AnalysisDocument.model_validate(
             {**document.model_dump(), "requirements": state["baseline"]}
         )
+        updated = AnalysisDocument.model_validate(
+            {**updated.model_dump(), "answer_reviews": submission.get("answer_reviews", {})}
+        )
+        updated = add_followups(updated, answers)
         updated = incorporate_decisions(updated, state["baseline"], answers, refs)
         validate_sources(updated, sources)
         return {
@@ -193,7 +209,7 @@ def graph_definition(llm: StructuredLLM, saver: TransactionalSaver, batch_size: 
             "answers": answers,
             "answer_refs": refs,
             "sources": sources,
-            "usage": state["usage"],
+            "usage": state["usage"] + submission.get("usage", []),
             "summary": None,
             "markdown": None,
             "submission": None,

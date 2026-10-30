@@ -1,5 +1,11 @@
 # BA Agent — Phase 2
 
+**Current workspace and semantic-validation changes:** see
+[Implementation review](docs/IMPLEMENTATION_REVIEW.md) for the current behavior,
+confirmation policy, migration 0003, file inventory and Windows commands. Historical
+verification records below describe earlier iterations; answer saves now use targeted
+semantic review rather than accepting every nonempty answer.
+
 FastAPI/React modular monolith for versioned business requirement intake, remote
 Ollama analysis, persisted customer clarification and draft JSON/Markdown summaries.
 Phase 1 APIs remain available. No approvals, architecture agent, stories or tasks

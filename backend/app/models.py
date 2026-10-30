@@ -78,3 +78,14 @@ class GraphRuntime(Base):
     __tablename__ = "graph_runtime"
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), primary_key=True)
     payload: Mapped[dict] = mapped_column(JSON)
+
+
+class AnswerValidationEvent(Base):
+    __tablename__ = "answer_validation_events"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    question_id: Mapped[str] = mapped_column(String(20))
+    analysis_version: Mapped[int] = mapped_column(Integer)
+    value: Mapped[str | list[str]] = mapped_column(JSON)
+    assessment: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)

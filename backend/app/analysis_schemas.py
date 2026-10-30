@@ -37,9 +37,17 @@ class ExtractedRequirement(StrictModel):
     origin: Literal["stated", "assumption", "customer_answer"]
     source_refs: list[str] = Field(max_length=200)
     resolution: Literal["ACTIVE", "SUPERSEDED"] = "ACTIVE"
+    title: str = ""
+    classification: Literal["STATED", "INFERRED", "CUSTOMER_CONFIRMED", "UNRESOLVED"] = "STATED"
 
     @model_validator(mode="after")
     def provenance(self):
+        self.classification = {
+            "stated": "STATED",
+            "assumption": "INFERRED",
+            "customer_answer": "CUSTOMER_CONFIRMED",
+        }[self.origin]
+        self.title = self.title or self.text.split(".")[0][:100]
         if self.origin != "assumption" and not self.source_refs:
             raise ValueError("Stated requirements need source references")
         if self.category == "assumption" and self.origin != "assumption":
@@ -62,9 +70,17 @@ class Question(StrictModel):
     priority: int = Field(ge=1, le=5)
     condition: Condition | None
     decision_category: Category = "business_rule"
+    exclusive_options: list[str] = Field(default_factory=list)
+    conflicting_options: list[list[str]] = Field(default_factory=list)
+    generated_from_question_id: str | None = None
+    why_it_matters: str = ""
 
     @model_validator(mode="after")
     def choices(self):
+        if not set(self.exclusive_options) <= set(self.options):
+            raise ValueError("Unknown exclusive option")
+        if any(not set(group) <= set(self.options) for group in self.conflicting_options):
+            raise ValueError("Unknown conflicting option")
         if len(self.options) != len(set(self.options)) or any(not x.strip() for x in self.options):
             raise ValueError("Options must be distinct and nonempty")
         if self.type in {"single_select", "multi_select"} and len(self.options) < 2:
@@ -83,6 +99,30 @@ class Gap(StrictModel):
     question_ids: list[str] = Field(min_length=1)
 
 
+class AtomicClaim(StrictModel):
+    key: str = Field(pattern=r"^[a-z][a-z0-9_]{0,60}$")
+    title: str = Field(min_length=1, max_length=160)
+    text: str = Field(min_length=1, max_length=3000)
+    category: Category
+    source_excerpt: str = Field(min_length=1, max_length=10000)
+
+
+class AnswerAssessment(StrictModel):
+    question_id: str
+    status: Literal["VALID", "INCOMPLETE", "UNCLEAR", "CONTRADICTORY", "NEEDS_REVIEW"]
+    reason: str = Field(min_length=1, max_length=1000)
+    suggested_clarification: str = Field(max_length=2000)
+    requirements: list[AtomicClaim] = Field(max_length=12)
+    open_details: list[str] = Field(max_length=3)
+    confirmed_by_customer: bool = False
+    confirmation_requested: bool = False
+    confirmation_reason: str = ""
+
+
+class AnswerReviewBatch(StrictModel):
+    assessments: list[AnswerAssessment] = Field(min_length=1, max_length=5)
+
+
 class AnalysisDocument(StrictModel):
     overview: str = Field(min_length=1, max_length=5000)
     requirements: list[ExtractedRequirement] = Field(min_length=1, max_length=500)
@@ -91,6 +131,8 @@ class AnalysisDocument(StrictModel):
     decision_requirement_ids: dict[str, str] = Field(default_factory=dict)
     grounding_reviewed: bool = False
     grounding_notes: dict[str, str] = Field(default_factory=dict)
+    answer_reviews: dict[str, AnswerAssessment] = Field(default_factory=dict)
+    decision_claim_ids: dict[str, str] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def references(self):
@@ -138,6 +180,9 @@ class GroundingReview(StrictModel):
 class Answer(StrictModel):
     question_id: str
     value: AnswerValue
+    question_version: int | None = Field(default=None, ge=1)
+    confirm: bool = False
+    confirmation_reason: str = Field(default="", max_length=2000)
 
 
 class VersionRequest(StrictModel):
@@ -146,6 +191,7 @@ class VersionRequest(StrictModel):
 
 class AnswerSubmission(VersionRequest):
     answers: list[Answer] = Field(min_length=1, max_length=5)
+    draft: bool = False
 
 
 class ClarificationDecision(StrictModel):
@@ -170,6 +216,7 @@ class Usage(StrictModel):
     output_tokens: int = Field(ge=0)
     latency_ms: int = Field(ge=0)
     attempts: int = Field(ge=1)
+    operation: str = "generation"
 
 
 class AnalysisRead(StrictModel):
@@ -191,3 +238,4 @@ class AnalysisRead(StrictModel):
     gap_statuses: list[dict]
     progress: dict
     needs_reconciliation: bool
+    answer_feedback: dict[str, AnswerAssessment] = Field(default_factory=dict)

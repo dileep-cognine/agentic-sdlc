@@ -5,9 +5,10 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 from test_analysis import FakeLLM, document, start
 
-from app.analysis_schemas import AnalysisDocument, GroundingReview, Usage
+from app.analysis_schemas import AnalysisDocument, Answer, GroundingReview, Usage
 from app.main import app
 from app.models import AnalysisVersion
+from app.services.answer_review import assess_answers
 from app.services.business_quality import (
     completion,
     gap_statuses,
@@ -24,6 +25,13 @@ def analysis_llm(client):
     fake = FakeLLM()
     app.dependency_overrides[get_llm] = lambda: fake
     return fake
+
+
+def reviewed(doc, answers):
+    reviews, _ = assess_answers(
+        FakeLLM(), doc, [Answer(question_id=k, value=v) for k, v in answers.items()]
+    )
+    return AnalysisDocument.model_validate({**doc.model_dump(), "answer_reviews": reviews})
 
 
 def shopping_document():
@@ -92,6 +100,7 @@ def test_selected_payment_and_delivery_are_real_requirements_not_just_citations(
     doc = shopping_document()
     baseline = [r.model_dump() for r in doc.requirements]
     answers = {"Q001": "Stripe", "Q002": ["Standard delivery", "Store pickup"]}
+    doc = reviewed(doc, answers)
     result = incorporate_decisions(
         doc, baseline, answers, {"Q001": "answer:Q001:v1", "Q002": "answer:Q002:v1"}
     )
@@ -100,7 +109,10 @@ def test_selected_payment_and_delivery_are_real_requirements_not_just_citations(
     payment = by_id[result.decision_requirement_ids["Q001"]]
     delivery = by_id[result.decision_requirement_ids["Q002"]]
     assert "Stripe" in payment.text and payment.category == "dependency"
-    assert "Standard delivery" in delivery.text and "Store pickup" in delivery.text
+    delivery_text = " ".join(
+        r.text for r in result.requirements if "answer:Q002:v1" in r.source_refs
+    )
+    assert "Standard delivery" in delivery_text and "Store pickup" in delivery_text
     assert "Express delivery" not in delivery.text
     assert payment.source_refs == ["answer:Q001:v1"]
     summary, markdown = summary_for(result, answers)
@@ -112,7 +124,9 @@ def test_selected_payment_and_delivery_are_real_requirements_not_just_citations(
 def test_edit_removes_obsolete_choice_and_preserves_stable_decision_id():
     doc = shopping_document()
     baseline = [r.model_dump() for r in doc.requirements]
+    doc = reviewed(doc, {"Q001": "Stripe"})
     original = incorporate_decisions(doc, baseline, {"Q001": "Stripe"}, {"Q001": "answer:Q001:v1"})
+    original = reviewed(original, {"Q001": "PayPal"})
     edited = incorporate_decisions(
         original, baseline, {"Q001": "PayPal"}, {"Q001": "answer:Q001:v2"}
     )
@@ -176,11 +190,16 @@ def test_tbd_answer_does_not_resolve_blocking_gap():
 
 def test_conditional_followup_keeps_gap_partial_until_answered():
     doc = AnalysisDocument.model_validate(document())
-    status = gap_statuses(doc, {"Q001": "yes"})[0]
-    assert status["status"] == "PARTIAL"
+    status = gap_statuses(reviewed(doc, {"Q001": "yes"}), {"Q001": "yes"})[0]
+    assert status["status"] == "AWAITING_ANSWER"
     assert status["pending_question_ids"] == ["Q002"]
-    assert gap_statuses(doc, {"Q001": "yes", "Q002": "TOTP"})[0]["status"] == "RESOLVED"
-    assert gap_statuses(doc, {"Q001": "no"})[0]["status"] == "RESOLVED"
+    assert (
+        gap_statuses(
+            reviewed(doc, {"Q001": "yes", "Q002": "TOTP"}), {"Q001": "yes", "Q002": "TOTP"}
+        )[0]["status"]
+        == "RESOLVED"
+    )
+    assert gap_statuses(reviewed(doc, {"Q001": "no"}), {"Q001": "no"})[0]["status"] == "RESOLVED"
 
 
 def test_api_deferred_answer_is_saved_but_summary_is_blocked(client, llm):
@@ -225,7 +244,7 @@ def test_reconcile_preserves_answers_and_old_versions(client, llm):
     result = repaired.json()
     assert not result["needs_reconciliation"]
     assert result["version"] == 3 and result["answers"] == saved["answers"]
-    assert "Selected answer: no" in result["markdown"]
+    assert "shall support no" in result["markdown"]
     assert (
         result["document"]["decision_requirement_ids"]
         == saved["document"]["decision_requirement_ids"]

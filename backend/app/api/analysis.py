@@ -8,7 +8,12 @@ from sqlalchemy import select
 
 from app.analysis_schemas import AnalysisRead, AnswerSubmission, VersionRequest
 from app.api.projects import Database, get_project, save_requirement
-from app.models import AnalysisVersion, ClarificationAnswer
+from app.models import (
+    AnalysisVersion,
+    AnswerValidationEvent,
+    ClarificationAnswer,
+    WorkflowCheckpoint,
+)
 from app.schemas import RequirementRead, RequirementSubmit
 from app.services.analysis import analysis_response, run_analysis
 from app.services.document_parser import MAX_UPLOAD_BYTES, DocumentError, parse_document
@@ -97,6 +102,39 @@ def answer(project_id: UUID, data: AnswerSubmission, db: Database, llm: LLM) -> 
 @router.post("/projects/{project_id}/reconcile", response_model=AnalysisRead)
 def reconcile(project_id: UUID, data: VersionRequest, db: Database, llm: LLM) -> dict:
     return run_analysis(db, get_project(project_id, db), data.expected_version, llm, reconcile=True)
+
+
+@router.get("/projects/{project_id}/validations")
+def validations(project_id: UUID, db: Database, limit: int = Query(50, ge=1, le=100)) -> list[dict]:
+    get_project(project_id, db)
+    return [
+        {
+            "question_id": r.question_id,
+            "analysis_version": r.analysis_version,
+            "assessment": r.assessment,
+            "created_at": r.created_at,
+        }
+        for r in db.scalars(
+            select(AnswerValidationEvent)
+            .where(AnswerValidationEvent.project_id == str(project_id))
+            .order_by(AnswerValidationEvent.created_at.desc())
+            .limit(limit)
+        )
+    ]
+
+
+@router.get("/projects/{project_id}/activity")
+def activity(project_id: UUID, db: Database, limit: int = Query(50, ge=1, le=100)) -> list[dict]:
+    get_project(project_id, db)
+    return [
+        {"version": r.project_version, "state": r.state, "created_at": r.created_at}
+        for r in db.scalars(
+            select(WorkflowCheckpoint)
+            .where(WorkflowCheckpoint.project_id == str(project_id))
+            .order_by(WorkflowCheckpoint.project_version.desc())
+            .limit(limit)
+        )
+    ]
 
 
 @router.get("/projects/{project_id}/answers/history")

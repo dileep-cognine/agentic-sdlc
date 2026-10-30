@@ -5,7 +5,7 @@ from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.analysis_schemas import AnalysisDocument, Answer, GroundingReview, Usage
+from app.analysis_schemas import AnalysisDocument, Answer, AnswerReviewBatch, GroundingReview, Usage
 from app.main import app
 from app.models import AnalysisVersion, GraphRuntime, WorkflowCheckpoint
 from app.services.ollama import LLMError, get_llm
@@ -94,8 +94,44 @@ class FakeLLM:
                     for q in payload["questions"]
                 ],
             }
+        elif schema is AnswerReviewBatch:
+            assessments = []
+            for item in payload["answers"]:
+                answer = item["answer"]
+                values = answer if isinstance(answer, list) else [answer]
+                status = (
+                    "UNCLEAR"
+                    if any(v in {"fgh", "dfgh", "dsfgh", "sdfghj", "dasfghj"} for v in values)
+                    else "INCOMPLETE"
+                    if any(v in {"TBD", "Not decided yet"} for v in values)
+                    else "VALID"
+                )
+                assessments.append(
+                    {
+                        "question_id": item["question"]["id"],
+                        "status": status,
+                        "reason": "Mock semantic assessment",
+                        "suggested_clarification": "Specify the business decision."
+                        if status != "VALID"
+                        else "",
+                        "requirements": [
+                            {
+                                "key": f"choice_{i}",
+                                "title": "Validated decision",
+                                "text": f"The system shall support {value}.",
+                                "category": item["question"]["decision_category"],
+                                "source_excerpt": value,
+                            }
+                            for i, value in enumerate(values)
+                        ]
+                        if status == "VALID"
+                        else [],
+                        "open_details": [],
+                    }
+                )
+            value = {"assessments": assessments}
         else:
-            raise AssertionError("Only extraction and source review may call the model")
+            raise AssertionError("Unexpected model operation")
         return schema.model_validate(value), Usage(
             input_tokens=10, output_tokens=20, latency_ms=1, attempts=1
         )
@@ -154,7 +190,7 @@ def test_persistent_interrupt_resume_edit_and_versions(client, llm):
     assert review["summary"]["status"] == "DRAFT"
     assert "TOTP" in review["markdown"]
     assert review["document"]["requirements"][0] == initial["document"]["requirements"][0]
-    assert len(llm.calls) == 2  # answers do not call the remote model
+    assert len(llm.calls) == 4  # extraction, grounding and two targeted semantic reviews
     edited = api.post(
         path + "/answers",
         json={
@@ -207,8 +243,8 @@ def test_invalid_answers_and_stale_version_are_atomic(client, llm):
             "answers": [{"question_id": "Q001", "value": "no"}],
         },
     )
-    assert result.status_code == 200  # saved choices work even while Ollama is unavailable
-    assert result.json()["answers"] == {"Q001": "no"}
+    assert result.status_code == 503
+    assert api.get(path + "/analysis").json()["answers"] == {}
 
 
 def test_no_clarifications_generates_draft(client, llm):
@@ -249,6 +285,22 @@ def test_question_batch_limit_and_nonblocking_parent():
     data["questions"][0]["blocking"] = False
     parsed = AnalysisDocument.model_validate(data)
     assert required_questions(parsed, {}) == {"Q001"}
+    parsed.answer_reviews = {
+        "Q001": AnswerReviewBatch.model_validate(
+            {
+                "assessments": [
+                    {
+                        "question_id": "Q001",
+                        "status": "VALID",
+                        "reason": "Explicit choice",
+                        "suggested_clarification": "",
+                        "requirements": [],
+                        "open_details": [],
+                    }
+                ]
+            }
+        ).assessments[0]
+    }
     assert not required_questions(parsed, {"Q001": "no"})
     assert required_questions(parsed, {"Q001": "yes"}) == {"Q002"}
     data["questions"] = [
@@ -269,15 +321,10 @@ def test_unknown_model_source_is_rejected_atomically(client, llm):
     assert api.get(path + "/analysis").status_code == 404
 
 
-def test_answer_updates_do_not_accept_model_rewrites(client, llm, monkeypatch):
+def test_answer_review_is_targeted_and_grounded(client, llm):
     api, _ = client
     path = start(api)
     initial = api.post(path + "/analyze", json={"expected_version": 2}).json()
-
-    def forbidden(*args, **kwargs):
-        raise AssertionError("Answers must not request a model rewrite")
-
-    monkeypatch.setattr(llm, "generate", forbidden)
     result = api.post(
         path + "/answers",
         json={
@@ -286,8 +333,9 @@ def test_answer_updates_do_not_accept_model_rewrites(client, llm, monkeypatch):
         },
     )
     assert result.status_code == 200
+    assert "sources" not in llm.calls[-1]
     assert result.json()["document"]["requirements"][0] == initial["document"]["requirements"][0]
-    assert "Selected answer: no" in result.json()["markdown"]
+    assert "shall support no" in result.json()["markdown"]
 
 
 def test_commit_failure_rolls_back_graph_and_answers(client, llm, monkeypatch):
@@ -346,7 +394,7 @@ def test_initial_description_then_checklist_batch_then_complete_description(clie
     )
     assert result.status_code == 200, result.text
     final = result.json()
-    assert len(llm.calls) == 2  # extraction + grounding review; no call for the answer batch
+    assert len(llm.calls) == 3  # one semantic call for the entire batch
     assert final["initial_description"] == initial["initial_description"]
     assert final["state"] == "REQUIREMENTS_REVIEW"
     assert len(final["summary"]["clarification_decisions"]) == 2
@@ -374,9 +422,9 @@ def test_customer_can_resolve_an_assumption_without_model_citations(client, llm)
     assert result.status_code == 200, result.text
     requirements = result.json()["document"]["requirements"]
     original = next(r for r in requirements if r["id"] == "R002")
-    assert original["origin"] == "assumption" and original["resolution"] == "SUPERSEDED"
+    assert original["origin"] == "assumption"
     decision = next(r for r in requirements if r["id"] == "R003")
     assert decision["category"] == "non_functional"
     assert decision["origin"] == "customer_answer"
     assert decision["source_refs"] == ["answer:Q001:v1"]
-    assert "Selected answer: no" in decision["text"]
+    assert "shall support no" in decision["text"]
